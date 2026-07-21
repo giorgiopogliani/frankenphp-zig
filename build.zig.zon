@@ -1,0 +1,14 @@
+.{
+    .name = .frankenphp,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0x67261fd8a7422acd,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "LICENSE",
+        "README.md",
+    },
+}
