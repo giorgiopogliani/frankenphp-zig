@@ -19,7 +19,7 @@
 
 static const char FRANKENPHP_INI[] =
     "html_errors=0\n"
-    "implicit_flush=1\n"
+    "implicit_flush=0\n"
     "output_buffering=0\n"
     "max_execution_time=0\n"
     "max_input_time=-1\n"
@@ -80,6 +80,7 @@ static void frankenphp_flush(void *server_context)
 {
     (void) server_context;
     sapi_send_headers();
+    frankenphp_zig_flush();
 }
 
 static char *frankenphp_getenv(const char *name, size_t name_length)

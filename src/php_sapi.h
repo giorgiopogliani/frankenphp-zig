@@ -24,6 +24,7 @@ int frankenphp_zig_php_execute_worker(const frankenphp_zig_request *request);
 
 /* Implemented by PhpRuntime.zig and called only from the PHP runtime thread. */
 size_t frankenphp_zig_write(const char *bytes, size_t length);
+void frankenphp_zig_flush(void);
 size_t frankenphp_zig_read_post(char *buffer, size_t length);
 const char *frankenphp_zig_read_cookies(void);
 size_t frankenphp_zig_variable_count(void);

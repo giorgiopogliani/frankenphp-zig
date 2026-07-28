@@ -18,6 +18,7 @@ config: Config,
 document_root_path: []const u8,
 document_root: Io.Dir,
 connection_slots: Io.Semaphore,
+connection_workers: Io.Semaphore,
 php_runtimes: *PhpRuntime.Pool,
 
 pub fn run(
@@ -59,6 +60,7 @@ pub fn run(
         .document_root_path = document_root_path,
         .document_root = document_root,
         .connection_slots = .{ .permits = config.max_connections },
+        .connection_workers = .{ .permits = 2 * (std.Thread.getCpuCount() catch 1) },
         .php_runtimes = &php_runtimes,
     };
 
@@ -82,8 +84,10 @@ pub fn run(
                 return err;
             },
         };
+        try server.connection_workers.wait(io);
         connections.concurrent(io, handleConnectionSlot, .{ &server, stream }) catch |err| {
             stream.close(io);
+            server.connection_workers.post(io);
             server.connection_slots.post(io);
             return err;
         };
@@ -91,6 +95,7 @@ pub fn run(
 }
 
 fn handleConnectionSlot(server: *Server, stream: Io.net.Stream) void {
+    defer server.connection_workers.post(server.io);
     defer server.connection_slots.post(server.io);
     defer stream.close(server.io);
     handleConnection(server, stream);
@@ -399,7 +404,8 @@ fn servePhp(
         .variables = variables,
         .headers_only = headers_only,
     };
-    var stream = server.php_runtimes.startStream(php_request) catch |err| switch (err) {
+    var stream_queue_buffer: [64 * 1024]u8 = undefined;
+    var stream = server.php_runtimes.startStream(php_request, &stream_queue_buffer) catch |err| switch (err) {
         error.RuntimeStopped => return respondText(request, .service_unavailable, "PHP runtime unavailable\n"),
         else => return err,
     };
@@ -410,59 +416,27 @@ fn servePhp(
         else => return err,
     };
 
+    if (stream.bufferedBody()) |response_body| {
+        return request.respond(response_body, .{
+            .status = stream.status(),
+            .extra_headers = stream.headers(),
+        });
+    }
+
     var output_buffer: [16 * 1024]u8 = undefined;
     var writer = try request.respondStreaming(&output_buffer, .{ .respond_options = .{
         .status = stream.status(),
         .extra_headers = stream.headers(),
     } });
-    while (try stream.next()) |chunk| {
-        defer stream.release(chunk);
-        try writer.writer.writeAll(chunk);
+    var chunk_buffer: [16 * 1024]u8 = undefined;
+    while (true) {
+        const length = try stream.read(&chunk_buffer);
+        if (length == 0) break;
+        try writer.writer.writeAll(chunk_buffer[0..length]);
         try writer.writer.flush();
         try writer.flush();
     }
     try writer.end();
-}
-
-const EventStreamSink = struct {
-    body_writer: *std.http.BodyWriter,
-
-    fn write(context: *anyopaque, bytes: []const u8) usize {
-        const sink: *EventStreamSink = @ptrCast(@alignCast(context));
-        sink.body_writer.writer.writeAll(bytes) catch return 0;
-        sink.body_writer.writer.flush() catch return 0;
-        sink.body_writer.flush() catch return 0;
-        return bytes.len;
-    }
-};
-
-fn acceptsEventStream(request: *const std.http.Server.Request) bool {
-    var headers = request.iterateHeaders();
-    while (headers.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "accept") and std.mem.indexOf(u8, header.value, "text/event-stream") != null) return true;
-    }
-    return false;
-}
-
-fn servePhpEventStream(server: *Server, request: *std.http.Server.Request, php_request: PhpRuntime.Request) !void {
-    var output_buffer: [16 * 1024]u8 = undefined;
-    var body_writer = try request.respondStreaming(&output_buffer, .{ .respond_options = .{
-        .status = .ok,
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "text/event-stream; charset=utf-8" },
-            .{ .name = "cache-control", .value = "no-cache" },
-            .{ .name = "x-accel-buffering", .value = "no" },
-        },
-    } });
-    defer body_writer.end() catch {};
-
-    var sink = EventStreamSink{ .body_writer = &body_writer };
-    const stream_sink: PhpRuntime.StreamSink = .{ .context = &sink, .write = EventStreamSink.write };
-    var streaming_request = php_request;
-    streaming_request.stream_sink = &stream_sink;
-
-    var response = try server.php_runtimes.execute(server.gpa, streaming_request);
-    defer response.deinit();
 }
 
 fn respondText(request: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
@@ -488,6 +462,7 @@ test "resolve PHP, static files, directory indexes, and the front controller" {
         .document_root_path = "",
         .document_root = tmp.dir,
         .connection_slots = .{ .permits = 1 },
+        .connection_workers = .{ .permits = 1 },
         .php_runtimes = undefined,
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

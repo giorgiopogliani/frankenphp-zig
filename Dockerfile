@@ -24,7 +24,7 @@ COPY build.zig build.zig.zon ./
 RUN zig build php-bootstrap -Doptimize=ReleaseSafe
 
 COPY . .
-RUN zig build -Doptimize=ReleaseSafe
+RUN zig build --release=fast
 
 FROM debian:bookworm-slim AS runtime
 

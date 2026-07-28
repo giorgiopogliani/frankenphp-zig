@@ -31,11 +31,6 @@ pub const Variable = struct {
     value: []const u8,
 };
 
-pub const StreamSink = struct {
-    context: *anyopaque,
-    write: *const fn (context: *anyopaque, bytes: []const u8) usize,
-};
-
 pub const Request = struct {
     script_filename: []const u8,
     method: []const u8,
@@ -46,7 +41,6 @@ pub const Request = struct {
     body: []const u8,
     variables: []const Variable,
     headers_only: bool,
-    stream_sink: ?*const StreamSink = null,
 };
 
 pub const Worker = struct {
@@ -107,7 +101,6 @@ const OwnedRequest = struct {
     body: []const u8,
     variables: []const OwnedVariable,
     headers_only: bool,
-    stream_sink: ?*const StreamSink,
 };
 
 const OwnedVariable = struct {
@@ -121,19 +114,15 @@ const JobState = enum {
     completed,
 };
 
-const OutputChunk = struct {
-    bytes: []u8,
-    next: ?*OutputChunk = null,
-};
-
 const Job = struct {
     runtime: *PhpRuntime,
     arena: std.heap.ArenaAllocator,
     request: OwnedRequest,
     output: std.ArrayList(u8) = .empty,
-    output_head: ?*OutputChunk = null,
-    output_tail: ?*OutputChunk = null,
+    stream_queue: Io.Queue(u8) = undefined,
     streaming: bool = false,
+    has_flushed: bool = false,
+    response_ready: Io.Event = .unset,
     headers: std.ArrayList(std.http.Header) = .empty,
     body_offset: usize = 0,
     status: u16 = 200,
@@ -161,12 +150,6 @@ const Job = struct {
 
     fn destroy(job: *Job) void {
         const gpa = job.runtime.gpa;
-        var chunk = job.output_head;
-        while (chunk) |current| {
-            chunk = current.next;
-            gpa.free(current.bytes);
-            gpa.destroy(current);
-        }
         job.arena.deinit();
         gpa.destroy(job);
     }
@@ -255,12 +238,7 @@ pub const Stream = struct {
     job: *Job,
 
     pub fn waitForHeaders(stream: *Stream) !void {
-        const runtime = stream.job.runtime;
-        try runtime.mutex.lock(runtime.io);
-        defer runtime.mutex.unlock(runtime.io);
-        while (stream.job.output_head == null and stream.job.state != .completed) {
-            try runtime.state_condition.wait(runtime.io, &runtime.mutex);
-        }
+        try stream.job.response_ready.wait(stream.job.runtime.io);
         if (stream.job.failure) |failure| return failure;
     }
 
@@ -272,26 +250,15 @@ pub const Stream = struct {
         return stream.job.headers.items;
     }
 
-    pub fn next(stream: *Stream) !?[]u8 {
-        const runtime = stream.job.runtime;
-        try runtime.mutex.lock(runtime.io);
-        defer runtime.mutex.unlock(runtime.io);
-        while (stream.job.output_head == null and stream.job.state != .completed) {
-            try runtime.state_condition.wait(runtime.io, &runtime.mutex);
-        }
-        if (stream.job.output_head) |chunk| {
-            stream.job.output_head = chunk.next;
-            if (stream.job.output_head == null) stream.job.output_tail = null;
-            const bytes = chunk.bytes;
-            runtime.gpa.destroy(chunk);
-            return bytes;
-        }
-        if (stream.job.failure) |failure| return failure;
-        return null;
+    pub fn bufferedBody(stream: *const Stream) ?[]const u8 {
+        return if (stream.job.has_flushed) null else stream.job.output.items;
     }
 
-    pub fn release(stream: *Stream, bytes: []u8) void {
-        stream.job.runtime.gpa.free(bytes);
+    pub fn read(stream: *Stream, buffer: []u8) !usize {
+        return stream.job.stream_queue.get(stream.job.runtime.io, buffer, 1) catch |err| switch (err) {
+            error.Closed => 0,
+            else => return err,
+        };
     }
 
     pub fn deinit(stream: *Stream) void {
@@ -347,9 +314,9 @@ pub const Pool = struct {
         return pool.runtimes[index].execute(allocator, request);
     }
 
-    pub fn startStream(pool: *Pool, request: Request) !Stream {
+    pub fn startStream(pool: *Pool, request: Request, queue_buffer: []u8) !Stream {
         const index = pool.next.fetchAdd(1, .monotonic) % pool.runtimes.len;
-        return pool.runtimes[index].startStream(request);
+        return pool.runtimes[index].startStream(request, queue_buffer);
     }
 };
 
@@ -362,10 +329,12 @@ pub fn stop(runtime: *PhpRuntime) void {
     runtime.started = false;
 }
 
-pub fn startStream(runtime: *PhpRuntime, request: Request) !Stream {
+pub fn startStream(runtime: *PhpRuntime, request: Request, queue_buffer: []u8) !Stream {
+    if (queue_buffer.len == 0) return error.InvalidStreamQueueCapacity;
     const job = try Job.create(runtime, request);
     errdefer job.destroy();
     job.streaming = true;
+    job.stream_queue = .init(queue_buffer);
     try enqueue(runtime, job);
     return .{ .job = job };
 }
@@ -466,6 +435,13 @@ fn runClassic(runtime: *PhpRuntime) void {
 
         job.run();
 
+        if (job.streaming) {
+            job.response_ready.set(runtime.io);
+            if (job.has_flushed) {
+                publishPendingOutput(job);
+                job.stream_queue.close(runtime.io);
+            }
+        }
         runtime.mutex.lockUncancelable(runtime.io);
         const abandoned = job.abandoned;
         job.state = .completed;
@@ -626,6 +602,13 @@ export fn frankenphp_zig_worker_complete(success: c_int) callconv(.c) void {
     if (success == 0 and job.failure == null) job.failure = error.ExecutionFailed;
     active_job = null;
 
+    if (job.streaming) {
+        job.response_ready.set(runtime.io);
+        if (job.has_flushed) {
+            publishPendingOutput(job);
+            job.stream_queue.close(runtime.io);
+        }
+    }
     runtime.mutex.lockUncancelable(runtime.io);
     const abandoned = job.abandoned;
     job.state = .completed;
@@ -654,7 +637,6 @@ fn cloneRequest(allocator: Allocator, request: Request) !OwnedRequest {
         .body = try allocator.dupe(u8, request.body),
         .variables = variables,
         .headers_only = request.headers_only,
-        .stream_sink = request.stream_sink,
     };
 }
 
@@ -662,21 +644,26 @@ fn currentJob() ?*Job {
     return active_job;
 }
 
+fn publishPendingOutput(job: *Job) void {
+    if (job.output.items.len == 0) return;
+    job.stream_queue.putAll(job.runtime.io, job.output.items) catch {
+        job.failure = error.RuntimeStopped;
+        return;
+    };
+    job.output.clearRetainingCapacity();
+}
+
+export fn frankenphp_zig_flush() callconv(.c) void {
+    const job = currentJob() orelse return;
+    if (!job.streaming) return;
+    job.has_flushed = true;
+    job.response_ready.set(job.runtime.io);
+    publishPendingOutput(job);
+}
+
 export fn frankenphp_zig_write(bytes: [*]const u8, length: usize) callconv(.c) usize {
     const job = currentJob() orelse return 0;
     if (job.failure != null) return 0;
-    if (job.request.stream_sink) |sink| return sink.write(sink.context, bytes[0..length]);
-    if (job.streaming) {
-        const chunk = job.runtime.gpa.create(OutputChunk) catch return 0;
-        errdefer job.runtime.gpa.destroy(chunk);
-        chunk.* = .{ .bytes = job.runtime.gpa.dupe(u8, bytes[0..length]) catch return 0 };
-        job.runtime.mutex.lockUncancelable(job.runtime.io);
-        if (job.output_tail) |tail| tail.next = chunk else job.output_head = chunk;
-        job.output_tail = chunk;
-        job.runtime.state_condition.broadcast(job.runtime.io);
-        job.runtime.mutex.unlock(job.runtime.io);
-        return length;
-    }
     if (length > job.runtime.max_output -| job.output.items.len) {
         job.failure = error.OutputTooLarge;
         return 0;
