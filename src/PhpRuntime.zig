@@ -7,7 +7,8 @@ const Io = std.Io;
 io: Io = undefined,
 gpa: Allocator = undefined,
 max_output: usize = 0,
-thread: ?std.Thread = null,
+worker_group: Io.Group = .init,
+started: bool = false,
 mutex: Io.Mutex = .init,
 queue_condition: Io.Condition = .init,
 state_condition: Io.Condition = .init,
@@ -215,7 +216,8 @@ fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: 
         .worker = worker,
         .lifecycle = lifecycle,
     };
-    runtime.thread = try std.Thread.spawn(.{}, workerMain, .{runtime});
+    runtime.worker_group.concurrent(io, workerMain, .{runtime}) catch return error.RuntimeInitializationFailed;
+    runtime.started = true;
 
     runtime.mutex.lockUncancelable(io);
     while (!runtime.ready) runtime.state_condition.waitUncancelable(io, &runtime.mutex);
@@ -223,8 +225,7 @@ fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: 
     runtime.mutex.unlock(io);
 
     if (!initialized) {
-        runtime.thread.?.join();
-        runtime.thread = null;
+        runtime.stop();
         return error.RuntimeInitializationFailed;
     }
 }
@@ -274,10 +275,12 @@ pub const Pool = struct {
 };
 
 pub fn stop(runtime: *PhpRuntime) void {
-    const thread = runtime.thread orelse return;
+    if (!runtime.started) return;
     failQueuedJobs(runtime, false);
-    thread.join();
-    runtime.thread = null;
+    runtime.worker_group.await(runtime.io) catch |err| switch (err) {
+        error.Canceled => {},
+    };
+    runtime.started = false;
 }
 
 pub fn execute(runtime: *PhpRuntime, allocator: Allocator, request: Request) !Response {
@@ -411,12 +414,6 @@ fn runWorker(runtime: *PhpRuntime, worker: Worker) void {
             }
         }
         active_job = null;
-        if (request_failed) {
-            std.log.err("PHP worker exited while handling {s} {s}", .{
-                bootstrap.request.method,
-                bootstrap.request.uri,
-            });
-        }
 
         runtime.mutex.lockUncancelable(runtime.io);
         const stopping = runtime.stopping;
@@ -534,13 +531,7 @@ export fn frankenphp_zig_worker_acquire() callconv(.c) ?*const CRequest {
 export fn frankenphp_zig_worker_complete(success: c_int) callconv(.c) void {
     const job = active_job orelse return;
     const runtime = job.runtime;
-    if (success == 0 and job.failure == null) {
-        std.log.err("PHP worker callback failed for {s} {s}", .{
-            job.request.method,
-            job.request.uri,
-        });
-        job.failure = error.ExecutionFailed;
-    }
+    if (success == 0 and job.failure == null) job.failure = error.ExecutionFailed;
     active_job = null;
 
     runtime.mutex.lockUncancelable(runtime.io);

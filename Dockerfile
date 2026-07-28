@@ -18,6 +18,11 @@ RUN apt-get update && apt-get install --yes --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+# PHP changes only when its source version or configure options change. Build it
+# in a separate layer so application-only changes reuse the expensive runtime.
+COPY build.zig build.zig.zon ./
+RUN zig build php-bootstrap -Doptimize=ReleaseSafe
+
 COPY . .
 RUN zig build -Doptimize=ReleaseSafe
 

@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
     );
     const php_prefix = php_prefix_option orelse ".phpsrc/embed";
     const php_bootstrap = if (php_prefix_option == null) addPhpBootstrapStep(b, addFetchPhpStep(b)) else null;
+    if (php_bootstrap) |bootstrap| {
+        b.step("php-bootstrap", "Build the embedded PHP runtime").dependOn(&bootstrap.step);
+    }
     const php_library = b.option(
         []const u8,
         "php-library",
