@@ -18,6 +18,12 @@ initialized: bool = false,
 stopping: bool = false,
 worker: ?Worker = null,
 worker_reached_acquire: bool = false,
+lifecycle: Lifecycle = .standalone,
+
+const Lifecycle = enum {
+    standalone,
+    pooled,
+};
 
 pub const Variable = struct {
     name: []const u8,
@@ -78,6 +84,9 @@ const CRequest = extern struct {
 
 extern fn frankenphp_zig_php_init() c_int;
 extern fn frankenphp_zig_php_shutdown() void;
+extern fn frankenphp_zig_php_is_zts() c_int;
+extern fn frankenphp_zig_php_thread_init() void;
+extern fn frankenphp_zig_php_thread_shutdown() void;
 extern fn frankenphp_zig_php_execute(request: *const CRequest) c_int;
 extern fn frankenphp_zig_php_execute_worker(request: *const CRequest) c_int;
 
@@ -191,11 +200,20 @@ threadlocal var active_job: ?*Job = null;
 threadlocal var active_runtime: ?*PhpRuntime = null;
 
 pub fn start(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker) !void {
+    try runtime.startWithLifecycle(io, gpa, max_output, worker, .standalone);
+}
+
+fn startPooled(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker) !void {
+    try runtime.startWithLifecycle(io, gpa, max_output, worker, .pooled);
+}
+
+fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker, lifecycle: Lifecycle) !void {
     runtime.* = .{
         .io = io,
         .gpa = gpa,
         .max_output = max_output,
         .worker = worker,
+        .lifecycle = lifecycle,
     };
     runtime.thread = try std.Thread.spawn(.{}, workerMain, .{runtime});
 
@@ -210,6 +228,43 @@ pub fn start(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, wo
         return error.RuntimeInitializationFailed;
     }
 }
+
+pub const Pool = struct {
+    gpa: Allocator,
+    runtimes: []PhpRuntime,
+    next: std.atomic.Value(usize) = .init(0),
+
+    pub fn start(io: Io, gpa: Allocator, max_output: usize, worker: ?Worker, count: usize) !Pool {
+        if (count == 0) return error.InvalidWorkerCount;
+        if (count > 1 and frankenphp_zig_php_is_zts() == 0) return error.ZtsRequired;
+        if (frankenphp_zig_php_init() != 0) return error.RuntimeInitializationFailed;
+        errdefer frankenphp_zig_php_shutdown();
+
+        const runtimes = try gpa.alloc(PhpRuntime, count);
+        errdefer gpa.free(runtimes);
+        var started: usize = 0;
+        errdefer {
+            for (runtimes[0..started]) |*runtime| runtime.stop();
+        }
+        for (runtimes) |*runtime| {
+            try runtime.startPooled(io, gpa, max_output, worker);
+            started += 1;
+        }
+        return .{ .gpa = gpa, .runtimes = runtimes };
+    }
+
+    pub fn stop(pool: *Pool) void {
+        for (pool.runtimes) |*runtime| runtime.stop();
+        pool.gpa.free(pool.runtimes);
+        frankenphp_zig_php_shutdown();
+        pool.* = undefined;
+    }
+
+    pub fn execute(pool: *Pool, allocator: Allocator, request: Request) !Response {
+        const index = pool.next.fetchAdd(1, .monotonic) % pool.runtimes.len;
+        return pool.runtimes[index].execute(allocator, request);
+    }
+};
 
 pub fn stop(runtime: *PhpRuntime) void {
     const thread = runtime.thread orelse return;
@@ -254,7 +309,13 @@ pub fn execute(runtime: *PhpRuntime, allocator: Allocator, request: Request) !Re
 }
 
 fn workerMain(runtime: *PhpRuntime) void {
-    const initialized = frankenphp_zig_php_init() == 0;
+    const initialized = switch (runtime.lifecycle) {
+        .standalone => frankenphp_zig_php_init() == 0,
+        .pooled => blk: {
+            frankenphp_zig_php_thread_init();
+            break :blk true;
+        },
+    };
 
     active_runtime = runtime;
     defer active_runtime = null;
@@ -268,7 +329,10 @@ fn workerMain(runtime: *PhpRuntime) void {
     runtime.mutex.unlock(runtime.io);
     if (!initialized) return;
 
-    defer frankenphp_zig_php_shutdown();
+    defer switch (runtime.lifecycle) {
+        .standalone => frankenphp_zig_php_shutdown(),
+        .pooled => frankenphp_zig_php_thread_shutdown(),
+    };
     if (runtime.worker) |worker| return runWorker(runtime, worker);
 
     runClassic(runtime);

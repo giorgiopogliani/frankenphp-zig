@@ -1,13 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Io = std.Io;
 
+const httpx = @import("httpx");
 const PhpRuntime = @import("PhpRuntime.zig");
-
-pub const RequestBody = struct {
-    bytes: []const u8,
-    has_body: bool,
-};
 
 pub const VariableOptions = struct {
     document_root: []const u8,
@@ -23,33 +18,10 @@ pub const VariableOptions = struct {
     content_length: usize,
 };
 
-pub fn readBody(
-    allocator: Allocator,
-    request: *std.http.Server.Request,
-    max_body: usize,
-) !RequestBody {
-    const original_method = request.head.method;
-    const has_framed_body = request.head.content_length != null or request.head.transfer_encoding != .none;
-    const should_read_body = original_method.requestHasBody() or has_framed_body;
-
-    // Zig exposes a body reader only for its method whitelist. Explicitly
-    // framed bodies on methods such as DELETE still belong to the PHP request.
-    if (has_framed_body and !original_method.requestHasBody()) request.head.method = .POST;
-    defer request.head.method = original_method;
-
-    var body_buffer: [16 * 1024]u8 = undefined;
-    const reader = try request.readerExpectContinue(&body_buffer);
-    const body = reader.allocRemaining(allocator, .limited(max_body)) catch |err| switch (err) {
-        error.StreamTooLong => return error.BodyTooLarge,
-        else => |other| return other,
-    };
-    return .{ .bytes = body, .has_body = should_read_body };
-}
-
 pub fn buildVariables(
     allocator: Allocator,
     parent_environ: *const std.process.Environ.Map,
-    request: *const std.http.Server.Request,
+    request: *const httpx.Request,
     options: VariableOptions,
 ) ![]const PhpRuntime.Variable {
     var variables: std.ArrayList(PhpRuntime.Variable) = .empty;
@@ -61,13 +33,13 @@ pub fn buildVariables(
     const server_port = try std.fmt.allocPrint(allocator, "{d}", .{options.server_port});
     const content_length = try std.fmt.allocPrint(allocator, "{d}", .{options.content_length});
     const php_self = try std.mem.concat(allocator, u8, &.{ options.script_name, options.path_info });
-    const request_uri = try allocator.dupe(u8, request.head.target);
-    const content_type = try allocator.dupe(u8, request.head.content_type orelse "");
+    const request_uri = request.uri.raw;
+    const content_type = request.headers.get(httpx.HeaderName.CONTENT_TYPE) orelse "";
     try variables.appendSlice(allocator, &.{
         .{ .name = "GATEWAY_INTERFACE", .value = "CGI/1.1" },
         .{ .name = "SERVER_SOFTWARE", .value = "FrankenPHP-Zig" },
-        .{ .name = "SERVER_PROTOCOL", .value = @tagName(request.head.version) },
-        .{ .name = "REQUEST_METHOD", .value = @tagName(request.head.method) },
+        .{ .name = "SERVER_PROTOCOL", .value = protocol(request.version) },
+        .{ .name = "REQUEST_METHOD", .value = request.method.toString() },
         .{ .name = "REQUEST_URI", .value = request_uri },
         .{ .name = "QUERY_STRING", .value = options.query },
         .{ .name = "DOCUMENT_ROOT", .value = options.document_root },
@@ -89,8 +61,7 @@ pub fn buildVariables(
         .{ .name = "CONTENT_LENGTH", .value = content_length },
     });
 
-    var headers = request.iterateHeaders();
-    while (headers.next()) |header| {
+    for (request.headers.entries.items) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "host")) {
             const host = parseHost(header.value);
             try variables.append(allocator, .{ .name = "SERVER_NAME", .value = try allocator.dupe(u8, host.name) });
@@ -113,12 +84,17 @@ pub fn buildVariables(
     return variables.toOwnedSlice(allocator);
 }
 
-pub fn cookies(request: *const std.http.Server.Request) ?[]const u8 {
-    var headers = request.iterateHeaders();
-    while (headers.next()) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "cookie")) return header.value;
-    }
-    return null;
+pub fn cookies(request: *const httpx.Request) ?[]const u8 {
+    return request.headers.get(httpx.HeaderName.COOKIE);
+}
+
+fn protocol(version: httpx.Version) []const u8 {
+    return switch (version) {
+        .HTTP_1_0 => "HTTP/1.0",
+        .HTTP_1_1 => "HTTP/1.1",
+        .HTTP_2 => "HTTP/2",
+        .HTTP_3 => "HTTP/3",
+    };
 }
 
 const ParsedHost = struct {
@@ -138,19 +114,13 @@ fn parseHost(value: []const u8) ParsedHost {
     return .{ .name = host[0..colon], .port = host[colon + 1 ..] };
 }
 
-test "build embedded PHP server variables without trusting Proxy" {
-    var input = Io.Reader.fixed(
-        "POST /submit?source=test HTTP/1.1\r\n" ++
-            "Host: example.test:8443\r\n" ++
-            "Authorization: Bearer token\r\n" ++
-            "Proxy: attacker.example\r\n" ++
-            "Content-Type: text/plain\r\n" ++
-            "Content-Length: 4\r\n\r\nbody",
-    );
-    var output_buffer: [64]u8 = undefined;
-    var output: Io.Writer.Discarding = .init(&output_buffer);
-    var server = std.http.Server.init(&input, &output.writer);
-    var request = try server.receiveHead();
+test "build PHP variables from an httpx request" {
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/submit?source=test");
+    defer request.deinit();
+    try request.setHeader(httpx.HeaderName.HOST, "example.test:8443");
+    try request.setHeader(httpx.HeaderName.AUTHORIZATION, "Bearer token");
+    try request.setHeader("Proxy", "attacker.example");
+    try request.setHeader(httpx.HeaderName.CONTENT_TYPE, "text/plain");
 
     var environ = std.process.Environ.Map.init(std.testing.allocator);
     defer environ.deinit();

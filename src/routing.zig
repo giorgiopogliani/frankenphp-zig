@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 pub const Target = struct {
     path: []const u8,
     query: []const u8,
+    trailing_slash: bool,
 };
 
 pub const NormalizeError = error{
@@ -58,6 +59,7 @@ pub fn normalizeTarget(allocator: Allocator, raw_target: []const u8) (NormalizeE
     return .{
         .path = path,
         .query = try allocator.dupe(u8, query),
+        .trailing_slash = decoded.len > 1 and decoded[decoded.len - 1] == '/',
     };
 }
 
@@ -77,6 +79,16 @@ test "normalize request target" {
 
     try std.testing.expectEqualStrings("images/logo wide.svg", target.path);
     try std.testing.expectEqualStrings("v=2", target.query);
+    try std.testing.expect(!target.trailing_slash);
+}
+
+test "normalization preserves trailing slashes for directory routing" {
+    const target = try normalizeTarget(std.testing.allocator, "/docs%2F");
+    defer std.testing.allocator.free(target.path);
+    defer std.testing.allocator.free(target.query);
+
+    try std.testing.expectEqualStrings("docs", target.path);
+    try std.testing.expect(target.trailing_slash);
 }
 
 test "normalization rejects traversal and encoded separators" {

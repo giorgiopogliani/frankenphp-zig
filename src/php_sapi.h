@@ -16,6 +16,9 @@ typedef struct {
 
 int frankenphp_zig_php_init(void);
 void frankenphp_zig_php_shutdown(void);
+int frankenphp_zig_php_is_zts(void);
+void frankenphp_zig_php_thread_init(void);
+void frankenphp_zig_php_thread_shutdown(void);
 int frankenphp_zig_php_execute(const frankenphp_zig_request *request);
 int frankenphp_zig_php_execute_worker(const frankenphp_zig_request *request);
 

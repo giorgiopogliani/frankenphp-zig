@@ -60,6 +60,7 @@ fn printHelp(io: std.Io) !void {
         \\  --max-output SIZE   Maximum PHP response size (default: 16m)
         \\  --max-connections N Maximum concurrent connections (default: 128)
         \\  --request-timeout N Per-request timeout in seconds (default: 30)
+        \\  --workers N      PHP runtime workers (default: 1; Octane: its worker count or CPU count)
         \\
     );
 }

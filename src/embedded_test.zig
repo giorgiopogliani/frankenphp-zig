@@ -3,6 +3,26 @@ const build_options = @import("build_options");
 
 const PhpRuntime = @import("PhpRuntime.zig");
 
+test "ZTS PHP runtime pool executes requests" {
+    var pool = try PhpRuntime.Pool.start(std.testing.io, std.testing.allocator, 1024 * 1024, null, 2);
+    defer pool.stop();
+
+    var response = try pool.execute(std.testing.allocator, .{
+        .script_filename = build_options.fixture_path,
+        .method = "GET",
+        .uri = "/pool",
+        .query = "",
+        .content_type = null,
+        .cookies = null,
+        .body = "",
+        .variables = &.{},
+        .headers_only = false,
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+}
+
 test "PHP stays embedded and resets request state" {
     var runtime: PhpRuntime = .{};
     try runtime.start(std.testing.io, std.testing.allocator, 1024 * 1024, null);
@@ -91,6 +111,28 @@ test "embedded PHP provides Laravel string encoding support" {
 
     try std.testing.expectEqual(std.http.Status.ok, response.status);
     try std.testing.expectEqualStrings("{\"extension\":true,\"function\":true}", response.body);
+}
+
+test "embedded PHP provides sodium cryptography constants" {
+    var runtime: PhpRuntime = .{};
+    try runtime.start(std.testing.io, std.testing.allocator, 1024, null);
+    defer runtime.stop();
+
+    var response = try runtime.execute(std.testing.allocator, .{
+        .script_filename = build_options.sodium_fixture_path,
+        .method = "GET",
+        .uri = "/sodium.php",
+        .query = "",
+        .content_type = null,
+        .cookies = null,
+        .body = "",
+        .variables = &.{},
+        .headers_only = false,
+    });
+    defer response.deinit();
+
+    try std.testing.expectEqual(std.http.Status.ok, response.status);
+    try std.testing.expectEqualStrings("{\"extension\":true,\"aead_key_bytes\":true}", response.body);
 }
 
 test "embedded PHP provides Laravel database drivers" {

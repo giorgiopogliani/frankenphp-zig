@@ -12,6 +12,7 @@ max_request_body: usize = 10 * 1024 * 1024,
 max_php_output: usize = 16 * 1024 * 1024,
 max_connections: usize = 128,
 request_timeout_seconds: u32 = 30,
+php_workers: usize = 1,
 
 pub const Mode = enum {
     classic,
@@ -62,6 +63,12 @@ pub fn parse(args: []const []const u8) (ParseError || std.fmt.ParseIntError)!Con
             index += 1;
             if (index >= args.len) return error.MissingValue;
             config.request_timeout_seconds = try parsePositive(u32, args[index]);
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            index += 1;
+            if (index >= args.len) return error.MissingValue;
+            config.php_workers = try parsePositive(usize, args[index]);
+        } else {
+            return error.InvalidArgument;
         }
     }
 
@@ -84,6 +91,13 @@ pub fn applyEnvironment(config: *Config, environ: *const std.process.Environ.Map
     if (environ.get("REQUEST_MAX_EXECUTION_TIME")) |value| {
         if (value.len != 0) config.request_timeout_seconds = try parsePositive(u32, value);
     }
+    if (environ.get("CADDY_SERVER_WORKER_COUNT")) |value| {
+        if (value.len != 0) {
+            config.php_workers = try parsePositive(usize, value);
+            return;
+        }
+    }
+    config.php_workers = std.Thread.getCpuCount() catch 1;
 }
 
 fn parseOctaneServerName(value: []const u8) (ParseError || std.fmt.ParseIntError)!u16 {
@@ -132,6 +146,8 @@ test "parse server configuration" {
         "64",
         "--request-timeout",
         "15",
+        "--workers",
+        "4",
     });
 
     try std.testing.expectEqualStrings("127.0.0.1", config.listen_host);
@@ -140,6 +156,7 @@ test "parse server configuration" {
     try std.testing.expectEqual(2 * 1024 * 1024, config.max_request_body);
     try std.testing.expectEqual(64, config.max_connections);
     try std.testing.expectEqual(15, config.request_timeout_seconds);
+    try std.testing.expectEqual(4, config.php_workers);
 }
 
 test "configuration rejects port zero" {
@@ -157,6 +174,7 @@ test "configuration derives worker mode from Octane environment" {
     try environ.put("APP_PUBLIC_PATH", "/app/public");
     try environ.put("CADDY_SERVER_SERVER_NAME", "http://:8000");
     try environ.put("REQUEST_MAX_EXECUTION_TIME", "45");
+    try environ.put("CADDY_SERVER_WORKER_COUNT", "2");
 
     var config = try parse(&.{ "-c", "/app/vendor/laravel/octane/src/Commands/stubs/Caddyfile" });
     try config.applyEnvironment(&environ);
@@ -166,6 +184,7 @@ test "configuration derives worker mode from Octane environment" {
     try std.testing.expectEqual(8000, config.listen_port);
     try std.testing.expectEqualStrings("/app/public", config.document_root);
     try std.testing.expectEqual(45, config.request_timeout_seconds);
+    try std.testing.expectEqual(2, config.php_workers);
 }
 
 test "configuration rejects unbounded resource settings" {

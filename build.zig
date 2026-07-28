@@ -29,14 +29,14 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run the Caddy-free FrankenPHP server").dependOn(&run.step);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
+    const unit_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
+    addHttpxImport(b, unit_test_module, target, optimize);
+    const tests = b.addTest(.{ .root_module = unit_test_module });
     const run_tests = b.addRunArtifact(tests);
     b.step("unit-test", "Run unit tests that do not require libphp").dependOn(&run_tests.step);
 
@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
     integration_options.addOption([]const u8, "fixture_path", b.pathFromRoot("tests/index.php"));
     integration_options.addOption([]const u8, "mbstring_fixture_path", b.pathFromRoot("tests/mbstring.php"));
     integration_options.addOption([]const u8, "pdo_fixture_path", b.pathFromRoot("tests/pdo.php"));
+    integration_options.addOption([]const u8, "sodium_fixture_path", b.pathFromRoot("tests/sodium.php"));
     integration_options.addOption([]const u8, "intl_fixture_path", b.pathFromRoot("tests/intl.php"));
     integration_options.addOption([]const u8, "worker_fixture_path", b.pathFromRoot("tests/frankenphp-worker.php"));
     integration_options.addOption([]const u8, "worker_exit_fixture_path", b.pathFromRoot("tests/worker-exit.php"));
@@ -118,7 +119,7 @@ fn addPhpBootstrapStep(b: *std.Build, fetch_php: *std.Build.Step.Run) *std.Build
         "sh", "-eu", "-c",
         \\php_prefix='.phpsrc/embed'
         \\php_version="$(cat .phpsrc/current-version)"
-        \\php_build_id="$php_version:static-embed-v3-openssl"
+        \\php_build_id="$php_version:static-embed-v5-zts-openssl-sodium"
         \\if [ -f "$php_prefix/php-version" ] && [ "$(cat "$php_prefix/php-version")" = "$php_build_id" ] && find "$php_prefix/lib" -maxdepth 1 -name 'libphp.*' -type f | grep -q .; then
         \\    exit 0
         \\fi
@@ -138,6 +139,20 @@ fn addPhpBootstrapStep(b: *std.Build, fetch_php: *std.Build.Step.Run) *std.Build
         \\    fi
         \\fi
         \\pkg-config --exists openssl
+        \\if ! pkg-config --exists libxml-2.0 && command -v brew >/dev/null 2>&1; then
+        \\    libxml_prefix="$(brew --prefix libxml2)"
+        \\    if [ -d "$libxml_prefix/lib/pkgconfig" ]; then
+        \\        export PKG_CONFIG_PATH="$libxml_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        \\    fi
+        \\fi
+        \\pkg-config --exists libxml-2.0
+        \\if ! pkg-config --exists libsodium && command -v brew >/dev/null 2>&1; then
+        \\    sodium_prefix="$(brew --prefix libsodium)"
+        \\    if [ -d "$sodium_prefix/lib/pkgconfig" ]; then
+        \\        export PKG_CONFIG_PATH="$sodium_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        \\    fi
+        \\fi
+        \\pkg-config --exists libsodium
         \\iconv_option=''
         \\if iconv_prefix="$(pkg-config --variable=prefix libiconv 2>/dev/null)"; then
         \\    iconv_option="--with-iconv=$iconv_prefix"
@@ -146,9 +161,7 @@ fn addPhpBootstrapStep(b: *std.Build, fetch_php: *std.Build.Step.Run) *std.Build
         \\(
         \\    cd "$source_dir"
         \\    rm -f config.cache config.log config.nice
-        \\    libxml_prefix="$(brew --prefix libxml2)"
-        \\    export PKG_CONFIG_PATH="$libxml_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-        \\    ./configure --prefix="$(cd ../.. && pwd)/$php_prefix" --enable-embed=static --disable-cgi --disable-phpdbg --disable-dom --disable-simplexml --disable-xml --disable-xmlreader --disable-xmlwriter --enable-mbstring --enable-intl --enable-pcntl $iconv_option --with-openssl --with-mysqlnd-ssl --with-pdo-mysql=mysqlnd
+        \\    ./configure --prefix="$(cd ../.. && pwd)/$php_prefix" --enable-embed=static --enable-zts --disable-cgi --disable-phpdbg --disable-dom --disable-simplexml --disable-xml --disable-xmlreader --disable-xmlwriter --enable-mbstring --enable-intl --enable-pcntl $iconv_option --with-openssl --with-sodium --with-mysqlnd-ssl --with-pdo-mysql=mysqlnd
         \\    make clean
         \\    make -j "$jobs"
         \\    make install
@@ -198,7 +211,21 @@ fn embeddedPhpModule(
         .file = b.path("src/php_sapi.c"),
         .flags = &.{"-std=c11"},
     });
+    addHttpxImport(b, module, target, optimize);
     return module;
+}
+
+fn addHttpxImport(
+    b: *std.Build,
+    module: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const httpx = b.dependency("httpx", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("httpx", httpx.module("httpx"));
 }
 
 fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
@@ -207,6 +234,7 @@ fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarg
             "/opt/homebrew/opt/icu4c/lib",
             "/opt/homebrew/opt/libiconv/lib",
             "/opt/homebrew/opt/openssl@3/lib",
+            "/opt/homebrew/opt/libsodium/lib",
             "/opt/homebrew/opt/libxml2/lib",
             "/opt/homebrew/opt/oniguruma/lib",
         };
@@ -215,11 +243,11 @@ fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarg
         }
     }
 
-    const dependencies = [_][]const u8{
+    const common_dependencies = [_][]const u8{
         "onig",
-        "iconv",
         "ssl",
         "crypto",
+        "sodium",
         "xml2",
         "sqlite3",
         "icuio",
@@ -229,8 +257,15 @@ fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarg
         "resolv",
         "z",
     };
-    for (&dependencies) |dependency| {
+    for (&common_dependencies) |dependency| {
         module.linkSystemLibrary(dependency, .{
+            .use_pkg_config = .no,
+            .preferred_link_mode = .dynamic,
+            .search_strategy = .paths_first,
+        });
+    }
+    if (target.result.os.tag == .macos) {
+        module.linkSystemLibrary("iconv", .{
             .use_pkg_config = .no,
             .preferred_link_mode = .dynamic,
             .search_strategy = .paths_first,

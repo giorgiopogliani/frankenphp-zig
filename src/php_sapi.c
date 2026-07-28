@@ -478,6 +478,32 @@ void frankenphp_zig_php_shutdown(void)
 #endif
 }
 
+int frankenphp_zig_php_is_zts(void)
+{
+#ifdef ZTS
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void frankenphp_zig_php_thread_init(void)
+{
+#ifdef ZTS
+    (void)ts_resource(0);
+#ifdef PHP_WIN32
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+#endif
+}
+
+void frankenphp_zig_php_thread_shutdown(void)
+{
+#ifdef ZTS
+    ts_free_thread();
+#endif
+}
+
 int frankenphp_zig_php_execute(const frankenphp_zig_request *request)
 {
     int request_started = 0;

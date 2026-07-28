@@ -2,15 +2,20 @@
 
 A Caddy-free PHP application server written in Zig 0.16.
 
-The Zig executable owns HTTP serving, PHP routing, and request scheduling. PHP is linked into the executable through a small custom SAPI
-bridge, initialized once, and executed in-process. The server never launches
-`php`, `php-cgi`, or another PHP child process.
+The Zig executable owns HTTP serving, PHP routing, and request scheduling through
+[httpx.zig](https://github.com/muhammad-fiaz/httpx.zig). PHP is linked into the
+executable through a small custom SAPI bridge, initialized once, and executed
+in-process. The server never launches `php`, `php-cgi`, or another PHP child
+process.
 
 ## Requirements
 
 - Zig 0.16.0
+- macOS or Linux (the automatic PHP bootstrap builds for the host platform;
+  cross-compiling requires a PHP embed library built for the target)
 - Standard PHP build prerequisites, including a C compiler, `make`, `curl`,
-  `tar`, `pkg-config`, and ICU development files for `intl`.
+  `tar`, `pkg-config`, ICU development files for `intl`, and libsodium
+  development files for the `sodium` extension.
 
 ## Build
 
@@ -44,12 +49,16 @@ zig-out/bin/frankenphp run --root public --port 8080
 The server resolves requests in this order:
 
 1. Existing `*.php` paths are executed by embedded PHP.
-2. All other paths fall back to the document root's `index.php`, with the
+2. Existing regular files are served by httpx with extension-based MIME types,
+   `ETag`/conditional GET handling, and `X-Content-Type-Options: nosniff`.
+3. Directories redirect to their slash-suffixed canonical URL, then resolve
+   `index.php` before `index.html`.
+4. All other paths fall back to the document root's `index.php`, with the
    original path exposed through `PATH_INFO`.
 
 URL paths are percent-decoded and normalized before filesystem access.
-Traversal components, NUL bytes, and backslash-based separator bypasses are
-rejected.
+Traversal components, NUL bytes, backslash-based separator bypasses, and final
+symlink targets are rejected.
 
 ### Options
 
@@ -60,6 +69,7 @@ rejected.
 --max-output SIZE   Maximum PHP response size (default: 16m)
 --max-connections N Maximum concurrent connections (default: 128)
 --request-timeout N HTTP request deadline in seconds (default: 30)
+--workers N         PHP runtime workers (default: 1)
 ```
 
 Sizes accept `k`, `m`, and `g` suffixes.
@@ -78,9 +88,9 @@ environment and always boots `${APP_PUBLIC_PATH}/frankenphp-worker.php` inside
 the embedded PHP runtime. The Laravel application remains booted while request
 state is reset between calls to `frankenphp_handle_request()`.
 
-The current runtime uses one persistent PHP worker. `MAX_REQUESTS` is honored
-by the Octane worker script, which is restarted in-process when its request
-limit is reached.
+Octane's worker count is mapped to a pool of persistent embedded PHP workers.
+When Octane requests `auto`, the pool uses the available CPU count. `MAX_REQUESTS`
+is honored independently by every worker script.
 
 ## Embedded runtime
 
@@ -89,9 +99,9 @@ HTTP request receives its own `php_request_startup()` / `php_request_shutdown()`
 cycle. Zig implements the SAPI callbacks for request bodies, cookies,
 `$_SERVER`, response headers, logging, and output.
 
-The initial runtime intentionally uses one PHP execution thread. This safely
-supports both NTS and ZTS PHP builds while keeping the engine persistent. PHP
-requests are queued onto the runtime thread. A ZTS worker pool is future work.
+PHP is built with ZTS and runs one persistent runtime thread per configured
+worker. Requests are distributed across the pool, while each worker keeps its
+own Laravel application booted and receives its own request lifecycle.
 
 The HTTP deadline closes timed-out connections and safely abandons their
 response, but it does not forcibly interrupt PHP code already running in the
