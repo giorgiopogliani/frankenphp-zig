@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const Config = @import("Config.zig");
-const httpx = @import("httpx");
+const Mime = @import("Mime.zig");
 const HttpRequest = @import("HttpRequest.zig");
 const PhpRuntime = @import("PhpRuntime.zig");
 const routing = @import("routing.zig");
@@ -326,7 +326,7 @@ fn serveStatic(server: *Server, allocator: Allocator, request: *std.http.Server.
     const etag = try buildStaticEtag(allocator, path, stat);
     defer allocator.free(etag);
     var headers: [3]std.http.Header = .{
-        .{ .name = "content-type", .value = httpx.mimeTypeFromPath(path) },
+        .{ .name = "content-type", .value = Mime.fromPath(path) },
         .{ .name = "x-content-type-options", .value = "nosniff" },
         .{ .name = "etag", .value = etag },
     };

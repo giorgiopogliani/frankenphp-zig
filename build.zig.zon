@@ -1,12 +1,7 @@
 .{
     .name = .frankenphp,
     .version = "0.1.0",
-    .dependencies = .{
-        .httpx = .{
-            .url = "https://github.com/muhammad-fiaz/httpx.zig/archive/refs/tags/0.1.3.tar.gz",
-            .hash = "httpx-0.1.2-8qj2euWvDwBMDjAcqpg5eiiOAOSLRwEfTR7L1xx1-8J5",
-        },
-    },
+    .dependencies = .{},
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0x67261fd8a7422acd,
     .paths = .{

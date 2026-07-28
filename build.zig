@@ -38,7 +38,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    addHttpxImport(b, unit_test_module, target, optimize);
     const tests = b.addTest(.{ .root_module = unit_test_module });
     const run_tests = b.addRunArtifact(tests);
     b.step("unit-test", "Run unit tests that do not require libphp").dependOn(&run_tests.step);
@@ -215,21 +214,7 @@ fn embeddedPhpModule(
         // PHP's Linux headers require POSIX signal and jump-buffer APIs.
         .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
     });
-    addHttpxImport(b, module, target, optimize);
     return module;
-}
-
-fn addHttpxImport(
-    b: *std.Build,
-    module: *std.Build.Module,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) void {
-    const httpx = b.dependency("httpx", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    module.addImport("httpx", httpx.module("httpx"));
 }
 
 fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
