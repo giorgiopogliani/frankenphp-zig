@@ -161,7 +161,7 @@ fn addPhpBootstrapStep(b: *std.Build, fetch_php: *std.Build.Step.Run) *std.Build
         \\(
         \\    cd "$source_dir"
         \\    rm -f config.cache config.log config.nice
-        \\    ./configure --prefix="$(cd ../.. && pwd)/$php_prefix" --enable-embed=static --enable-zts --disable-cgi --disable-phpdbg --disable-dom --disable-simplexml --disable-xml --disable-xmlreader --disable-xmlwriter --enable-mbstring --enable-intl --enable-pcntl $iconv_option --with-openssl --with-sodium --with-mysqlnd-ssl --with-pdo-mysql=mysqlnd
+        \\    ./configure --prefix="$(cd ../.. && pwd)/$php_prefix" --enable-embed=static --enable-zts --disable-cgi --disable-phpdbg --enable-dom --enable-simplexml --enable-xml --enable-xmlreader --enable-xmlwriter --enable-mbstring --enable-intl --enable-pcntl $iconv_option --with-openssl --with-sodium --with-mysqlnd-ssl --with-pdo-mysql=mysqlnd
         \\    make clean
         \\    make -j "$jobs"
         \\    make install
@@ -209,7 +209,8 @@ fn embeddedPhpModule(
     linkPhpDependencies(module, target);
     module.addCSourceFile(.{
         .file = b.path("src/php_sapi.c"),
-        .flags = &.{"-std=c11"},
+        // PHP's Linux headers require POSIX signal and jump-buffer APIs.
+        .flags = &.{ "-std=c11", "-D_GNU_SOURCE" },
     });
     addHttpxImport(b, module, target, optimize);
     return module;
@@ -272,13 +273,33 @@ fn linkPhpDependencies(module: *std.Build.Module, target: std.Build.ResolvedTarg
         });
     }
 
-    const cxx_runtime = switch (target.result.os.tag) {
-        .macos => "c++",
-        else => "stdc++",
-    };
-    module.linkSystemLibrary(cxx_runtime, .{
-        .use_pkg_config = .no,
-        .preferred_link_mode = .dynamic,
-        .search_strategy = .paths_first,
-    });
+    if (target.result.os.tag == .macos) {
+        module.linkSystemLibrary("c++", .{
+            .use_pkg_config = .no,
+            .preferred_link_mode = .dynamic,
+            .search_strategy = .paths_first,
+        });
+    } else if (target.result.os.tag == .linux) {
+        // PHP's intl extension is built with GNU libstdc++. Link its ABI
+        // library directly because Zig maps a "stdc++" system library to
+        // libc++, which has an incompatible ABI.
+        const libstdcxx_path = switch (target.result.cpu.arch) {
+            .x86_64 => "/usr/lib/x86_64-linux-gnu/libstdc++.so.6",
+            .aarch64 => "/usr/lib/aarch64-linux-gnu/libstdc++.so.6",
+            else => @panic("unsupported Linux C++ runtime architecture"),
+        };
+        const libgcc_path = switch (target.result.cpu.arch) {
+            .x86_64 => "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            .aarch64 => "/usr/lib/aarch64-linux-gnu/libgcc_s.so.1",
+            else => @panic("unsupported Linux C++ runtime architecture"),
+        };
+        const libgcc_static_path = switch (target.result.cpu.arch) {
+            .x86_64 => "/usr/lib/gcc/x86_64-linux-gnu/12/libgcc.a",
+            .aarch64 => "/usr/lib/gcc/aarch64-linux-gnu/12/libgcc.a",
+            else => @panic("unsupported Linux C++ runtime architecture"),
+        };
+        module.addObjectFile(.{ .cwd_relative = libstdcxx_path });
+        module.addObjectFile(.{ .cwd_relative = libgcc_path });
+        module.addObjectFile(.{ .cwd_relative = libgcc_static_path });
+    }
 }

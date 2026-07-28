@@ -68,11 +68,19 @@ pub fn run(
         .host = config.listen_host,
         .port = config.listen_port,
         .max_body_size = config.max_request_body,
-        .request_timeout_ms = @as(u64, config.request_timeout_seconds) * 1000,
-        .keep_alive_timeout_ms = @as(u64, config.request_timeout_seconds) * 1000,
+        // httpx treats zero as its 30-second default. Use its largest
+        // practical timeout when Octane explicitly disables the limit.
+        .request_timeout_ms = if (config.request_timeout_seconds == 0)
+            std.math.maxInt(u32)
+        else
+            @as(u64, config.request_timeout_seconds) * 1000,
+        .keep_alive_timeout_ms = if (config.request_timeout_seconds == 0)
+            std.math.maxInt(u32)
+        else
+            @as(u64, config.request_timeout_seconds) * 1000,
         .max_connections = @intCast(@min(config.max_connections, std.math.maxInt(u32))),
         .threads = @intCast(@min(worker_threads, std.math.maxInt(u32))),
-        .log_fn = discardHttpxLog,
+        .log_fn = logHttpx,
     });
     defer http_server.deinit();
 
@@ -91,7 +99,13 @@ pub fn run(
     try http_server.listen();
 }
 
-fn discardHttpxLog(_: httpx.LogLevel, _: []const u8) void {}
+fn logHttpx(level: httpx.LogLevel, message: []const u8) void {
+    // A peer may reset an idle keep-alive connection after receiving its
+    // response. httpx currently reports this normal disconnect as RecvFailed.
+    if (level == .err and std.mem.indexOf(u8, message, "Handler error: error.RecvFailed.") == null) {
+        std.log.err("httpx: {s}", .{message});
+    }
+}
 
 fn handleHttpxRequest(context: *httpx.Context) !httpx.Response {
     const server = active_server orelse return error.ServerNotRunning;

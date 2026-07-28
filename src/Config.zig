@@ -89,7 +89,8 @@ pub fn applyEnvironment(config: *Config, environ: *const std.process.Environ.Map
     );
 
     if (environ.get("REQUEST_MAX_EXECUTION_TIME")) |value| {
-        if (value.len != 0) config.request_timeout_seconds = try parsePositive(u32, value);
+        // Laravel Octane uses zero to disable its request execution limit.
+        if (value.len != 0) config.request_timeout_seconds = try std.fmt.parseInt(u32, value, 10);
     }
     if (environ.get("CADDY_SERVER_WORKER_COUNT")) |value| {
         if (value.len != 0) {
@@ -187,7 +188,20 @@ test "configuration derives worker mode from Octane environment" {
     try std.testing.expectEqual(2, config.php_workers);
 }
 
-test "configuration rejects unbounded resource settings" {
+test "configuration accepts Octane's disabled execution limit" {
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("LARAVEL_OCTANE", "1");
+    try environ.put("APP_PUBLIC_PATH", "/app/public");
+    try environ.put("CADDY_SERVER_SERVER_NAME", "http://:8000");
+    try environ.put("REQUEST_MAX_EXECUTION_TIME", "0");
+
+    var config = try parse(&.{ "-c", "/app/Caddyfile" });
+    try config.applyEnvironment(&environ);
+    try std.testing.expectEqual(0, config.request_timeout_seconds);
+}
+
+test "configuration rejects unbounded command-line resource settings" {
     try std.testing.expectError(error.InvalidSize, parse(&.{ "--max-connections", "0" }));
     try std.testing.expectError(error.InvalidSize, parse(&.{ "--request-timeout", "0" }));
 }

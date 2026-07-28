@@ -10,6 +10,7 @@
 #include "php_variables.h"
 #include "SAPI.h"
 #include "zend_exceptions.h"
+#include "zend_execute.h"
 #include "zend_signal.h"
 
 #ifdef HAVE_PHP_SESSION
@@ -248,6 +249,8 @@ static void frankenphp_reset_session(void)
 
 static void frankenphp_worker_request_shutdown(void)
 {
+    /* Do not let a request's timer fire while this worker is idle. */
+    zend_try { zend_unset_timeout(); } zend_end_try();
     zend_try { php_output_end_all(); } zend_end_try();
 
     const char **module_name;
@@ -280,6 +283,10 @@ static int frankenphp_worker_request_startup(const frankenphp_zig_request *reque
         PG(header_is_being_sent) = 0;
         PG(connection_status) = PHP_CONNECTION_NORMAL;
         sapi_activate();
+
+        /* php_request_startup() normally creates this timer. Worker mode
+         * preserves the process, so reset it for every handled request. */
+        zend_set_timeout(EG(timeout_seconds), 1);
 
         if (PG(output_handler) && PG(output_handler)[0]) {
             zval output_handler;

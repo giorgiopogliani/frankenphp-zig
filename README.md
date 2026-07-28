@@ -40,6 +40,23 @@ The default build configures and installs PHP's static embed SAPI automatically.
 
 The binary is written to `zig-out/bin/frankenphp`.
 
+## Container image
+
+Build a production image with its ZTS PHP embed runtime:
+
+```console
+docker build --tag frankenphp-zig .
+```
+
+Mount a PHP application at `/app` and publish the default HTTP port:
+
+```console
+docker run --rm --publish 8080:8080 --volume "$PWD:/app" frankenphp-zig
+```
+
+The container runs as an unprivileged `frankenphp` user and defaults to
+`frankenphp run --root public --port 8080`.
+
 ## Run a PHP application
 
 ```console

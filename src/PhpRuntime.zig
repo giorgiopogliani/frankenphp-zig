@@ -232,16 +232,23 @@ fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: 
 pub const Pool = struct {
     gpa: Allocator,
     runtimes: []PhpRuntime,
+    shared_global_lifecycle: bool,
     next: std.atomic.Value(usize) = .init(0),
 
     pub fn start(io: Io, gpa: Allocator, max_output: usize, worker: ?Worker, count: usize) !Pool {
         if (count == 0) return error.InvalidWorkerCount;
-        if (count > 1 and frankenphp_zig_php_is_zts() == 0) return error.ZtsRequired;
-        if (frankenphp_zig_php_init() != 0) return error.RuntimeInitializationFailed;
-        errdefer frankenphp_zig_php_shutdown();
 
         const runtimes = try gpa.alloc(PhpRuntime, count);
         errdefer gpa.free(runtimes);
+        if (count == 1) {
+            try runtimes[0].start(io, gpa, max_output, worker);
+            return .{ .gpa = gpa, .runtimes = runtimes, .shared_global_lifecycle = false };
+        }
+
+        if (frankenphp_zig_php_is_zts() == 0) return error.ZtsRequired;
+        if (frankenphp_zig_php_init() != 0) return error.RuntimeInitializationFailed;
+        errdefer frankenphp_zig_php_shutdown();
+
         var started: usize = 0;
         errdefer {
             for (runtimes[0..started]) |*runtime| runtime.stop();
@@ -250,13 +257,13 @@ pub const Pool = struct {
             try runtime.startPooled(io, gpa, max_output, worker);
             started += 1;
         }
-        return .{ .gpa = gpa, .runtimes = runtimes };
+        return .{ .gpa = gpa, .runtimes = runtimes, .shared_global_lifecycle = true };
     }
 
     pub fn stop(pool: *Pool) void {
         for (pool.runtimes) |*runtime| runtime.stop();
         pool.gpa.free(pool.runtimes);
-        frankenphp_zig_php_shutdown();
+        if (pool.shared_global_lifecycle) frankenphp_zig_php_shutdown();
         pool.* = undefined;
     }
 
@@ -404,6 +411,12 @@ fn runWorker(runtime: *PhpRuntime, worker: Worker) void {
             }
         }
         active_job = null;
+        if (request_failed) {
+            std.log.err("PHP worker exited while handling {s} {s}", .{
+                bootstrap.request.method,
+                bootstrap.request.uri,
+            });
+        }
 
         runtime.mutex.lockUncancelable(runtime.io);
         const stopping = runtime.stopping;
@@ -419,8 +432,11 @@ fn runWorker(runtime: *PhpRuntime, worker: Worker) void {
             return;
         }
         if (result != 0 and !request_failed) {
-            markWorkerFailed(runtime);
-            return;
+            // Octane workers may intentionally exit after their request limit.
+            // The runtime thread remains valid, so run a fresh worker bootstrap
+            // instead of permanently removing this slot from the pool.
+            std.log.warn("PHP worker exited; restarting it", .{});
+            continue;
         }
     }
 }
@@ -518,7 +534,13 @@ export fn frankenphp_zig_worker_acquire() callconv(.c) ?*const CRequest {
 export fn frankenphp_zig_worker_complete(success: c_int) callconv(.c) void {
     const job = active_job orelse return;
     const runtime = job.runtime;
-    if (success == 0 and job.failure == null) job.failure = error.ExecutionFailed;
+    if (success == 0 and job.failure == null) {
+        std.log.err("PHP worker callback failed for {s} {s}", .{
+            job.request.method,
+            job.request.uri,
+        });
+        job.failure = error.ExecutionFailed;
+    }
     active_job = null;
 
     runtime.mutex.lockUncancelable(runtime.io);

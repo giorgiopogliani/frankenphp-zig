@@ -1,0 +1,7 @@
+.git
+.zig-cache
+zig-out
+zig-pkg
+.phpsrc
+.pi-subagents
+.agents
