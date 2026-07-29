@@ -9,16 +9,16 @@ gpa: Allocator = undefined,
 max_output: usize = 0,
 worker_group: Io.Group = .init,
 started: bool = false,
+queue: *JobQueue = undefined,
+owned_queue: ?*JobQueue = null,
 mutex: Io.Mutex = .init,
-queue_condition: Io.Condition = .init,
 state_condition: Io.Condition = .init,
-queue_head: ?*Job = null,
-queue_tail: ?*Job = null,
 ready: bool = false,
 initialized: bool = false,
-stopping: bool = false,
 worker: ?Worker = null,
 worker_reached_acquire: bool = false,
+interrupt_handle: CInterruptHandle = .{},
+interrupt_fn: *const fn (CInterruptHandle) void = ignoreInterrupt,
 lifecycle: Lifecycle = .standalone,
 
 const Lifecycle = enum {
@@ -73,6 +73,12 @@ pub const Error = error{
     RuntimeStopped,
 };
 
+const CInterruptHandle = extern struct {
+    vm_interrupt: ?*anyopaque = null,
+    timed_out: ?*anyopaque = null,
+    thread: usize = 0,
+};
+
 const CRequest = extern struct {
     script_filename: [*:0]const u8,
     request_method: [*:0]const u8,
@@ -88,6 +94,8 @@ extern fn frankenphp_zig_php_shutdown() void;
 extern fn frankenphp_zig_php_is_zts() c_int;
 extern fn frankenphp_zig_php_thread_init() void;
 extern fn frankenphp_zig_php_thread_shutdown() void;
+extern fn frankenphp_zig_php_capture_interrupt_handle() CInterruptHandle;
+extern fn frankenphp_zig_php_interrupt(handle: CInterruptHandle) void;
 extern fn frankenphp_zig_php_execute(request: *const CRequest) c_int;
 extern fn frankenphp_zig_php_execute_worker(request: *const CRequest) c_int;
 
@@ -111,7 +119,12 @@ const OwnedVariable = struct {
 const JobState = enum {
     queued,
     running,
-    completed,
+};
+
+const DirectTransport = struct {
+    request: *std.http.Server.Request,
+    buffer: []u8,
+    writer: ?std.http.BodyWriter = null,
 };
 
 const Job = struct {
@@ -119,16 +132,18 @@ const Job = struct {
     arena: std.heap.ArenaAllocator,
     request: OwnedRequest,
     output: std.ArrayList(u8) = .empty,
-    stream_queue: Io.Queue(u8) = undefined,
-    streaming: bool = false,
-    has_flushed: bool = false,
-    response_ready: Io.Event = .unset,
+    direct_transport: ?DirectTransport = null,
     headers: std.ArrayList(std.http.Header) = .empty,
     body_offset: usize = 0,
     status: u16 = 200,
     failure: ?anyerror = null,
     next: ?*Job = null,
+    running_next: ?*Job = null,
     state: JobState = .queued,
+    complete: Io.Event = .unset,
+    submitted: bool = false,
+    canceled: std.atomic.Value(bool) = .init(false),
+    interrupt_handle: CInterruptHandle = .{},
     abandoned: bool = false,
     c_request: CRequest = undefined,
 
@@ -149,9 +164,16 @@ const Job = struct {
     }
 
     fn destroy(job: *Job) void {
-        const gpa = job.runtime.gpa;
+        const runtime = job.runtime;
+        if (job.submitted) {
+            runtime.queue.mutex.lockUncancelable(runtime.io);
+            std.debug.assert(runtime.queue.outstanding != 0);
+            runtime.queue.outstanding -= 1;
+            if (runtime.queue.outstanding == 0) runtime.queue.idle_condition.broadcast(runtime.io);
+            runtime.queue.mutex.unlock(runtime.io);
+        }
         job.arena.deinit();
-        gpa.destroy(job);
+        runtime.gpa.destroy(job);
     }
 
     fn run(job: *Job) void {
@@ -201,22 +223,79 @@ const Job = struct {
     }
 };
 
+const JobQueue = struct {
+    mutex: Io.Mutex = .init,
+    condition: Io.Condition = .init,
+    idle_condition: Io.Condition = .init,
+    head: ?*Job = null,
+    tail: ?*Job = null,
+    running_head: ?*Job = null,
+    outstanding: usize = 0,
+    stopping: bool = false,
+
+    fn enqueue(queue: *JobQueue, io: Io, job: *Job) !void {
+        try queue.mutex.lock(io);
+        defer queue.mutex.unlock(io);
+        if (queue.stopping) return error.RuntimeStopped;
+        if (queue.tail) |tail| tail.next = job else queue.head = job;
+        queue.tail = job;
+        job.submitted = true;
+        queue.outstanding += 1;
+        queue.condition.signal(io);
+    }
+
+    fn stop(queue: *JobQueue, io: Io) void {
+        queue.mutex.lockUncancelable(io);
+        queue.stopping = true;
+        queue.condition.broadcast(io);
+        queue.mutex.unlock(io);
+    }
+
+    fn waitUntilIdle(queue: *JobQueue, io: Io) void {
+        queue.mutex.lockUncancelable(io);
+        while (queue.outstanding != 0) queue.idle_condition.waitUncancelable(io, &queue.mutex);
+        queue.mutex.unlock(io);
+    }
+};
+
 threadlocal var active_job: ?*Job = null;
 threadlocal var active_runtime: ?*PhpRuntime = null;
 
 pub fn start(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker) !void {
-    try runtime.startWithLifecycle(io, gpa, max_output, worker, .standalone);
+    const queue = try gpa.create(JobQueue);
+    errdefer gpa.destroy(queue);
+    queue.* = .{};
+    try runtime.startWithLifecycle(io, gpa, max_output, worker, queue, queue, .standalone);
 }
 
-fn startPooled(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker) !void {
-    try runtime.startWithLifecycle(io, gpa, max_output, worker, .pooled);
+fn startPooled(
+    runtime: *PhpRuntime,
+    io: Io,
+    gpa: Allocator,
+    max_output: usize,
+    worker: ?Worker,
+    queue: *JobQueue,
+) !void {
+    try runtime.startWithLifecycle(io, gpa, max_output, worker, queue, null, .pooled);
 }
 
-fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: usize, worker: ?Worker, lifecycle: Lifecycle) !void {
+fn startWithLifecycle(
+    runtime: *PhpRuntime,
+    io: Io,
+    gpa: Allocator,
+    max_output: usize,
+    worker: ?Worker,
+    queue: *JobQueue,
+    owned_queue: ?*JobQueue,
+    lifecycle: Lifecycle,
+) !void {
     runtime.* = .{
         .io = io,
         .gpa = gpa,
         .max_output = max_output,
+        .queue = queue,
+        .owned_queue = owned_queue,
+        .interrupt_fn = phpInterrupt,
         .worker = worker,
         .lifecycle = lifecycle,
     };
@@ -229,62 +308,56 @@ fn startWithLifecycle(runtime: *PhpRuntime, io: Io, gpa: Allocator, max_output: 
     runtime.mutex.unlock(io);
 
     if (!initialized) {
-        runtime.stop();
+        failQueuedJobs(runtime, false);
+        runtime.awaitStopped();
+        runtime.owned_queue = null;
         return error.RuntimeInitializationFailed;
     }
 }
 
-pub const Stream = struct {
+pub const DirectResponse = struct {
     job: *Job,
 
-    pub fn waitForHeaders(stream: *Stream) !void {
-        try stream.job.response_ready.wait(stream.job.runtime.io);
-        if (stream.job.failure) |failure| return failure;
+    pub fn started(response: *const DirectResponse) bool {
+        return response.job.direct_transport.?.writer != null;
     }
 
-    pub fn status(stream: *const Stream) std.http.Status {
-        return @enumFromInt(stream.job.status);
-    }
-
-    pub fn headers(stream: *const Stream) []const std.http.Header {
-        return stream.job.headers.items;
-    }
-
-    pub fn bufferedBody(stream: *const Stream) ?[]const u8 {
-        return if (stream.job.has_flushed) null else stream.job.output.items;
-    }
-
-    pub fn read(stream: *Stream, buffer: []u8) !usize {
-        return stream.job.stream_queue.get(stream.job.runtime.io, buffer, 1) catch |err| switch (err) {
-            error.Closed => 0,
-            else => return err,
+    /// Waits until PHP has ended the response and returned connection ownership.
+    pub fn waitForCompletion(response: *DirectResponse) !void {
+        response.job.complete.wait(response.job.runtime.io) catch |err| {
+            _ = cancelJob(response.job, false);
+            response.job.complete.waitUncancelable(response.job.runtime.io);
+            return err;
         };
+        if (response.job.failure) |failure| return failure;
     }
 
-    pub fn deinit(stream: *Stream) void {
-        const runtime = stream.job.runtime;
-        runtime.mutex.lockUncancelable(runtime.io);
-        while (stream.job.state != .completed) runtime.state_condition.waitUncancelable(runtime.io, &runtime.mutex);
-        runtime.mutex.unlock(runtime.io);
-        stream.job.destroy();
-        stream.* = undefined;
+    pub fn deinit(response: *DirectResponse) void {
+        response.job.complete.waitUncancelable(response.job.runtime.io);
+        response.job.destroy();
+        response.* = undefined;
     }
 };
 
 pub const Pool = struct {
     gpa: Allocator,
+    io: Io,
+    queue: *JobQueue,
     runtimes: []PhpRuntime,
     shared_global_lifecycle: bool,
-    next: std.atomic.Value(usize) = .init(0),
 
     pub fn start(io: Io, gpa: Allocator, max_output: usize, worker: ?Worker, count: usize) !Pool {
         if (count == 0) return error.InvalidWorkerCount;
 
+        const queue = try gpa.create(JobQueue);
+        errdefer gpa.destroy(queue);
+        queue.* = .{};
         const runtimes = try gpa.alloc(PhpRuntime, count);
         errdefer gpa.free(runtimes);
+
         if (count == 1) {
-            try runtimes[0].start(io, gpa, max_output, worker);
-            return .{ .gpa = gpa, .runtimes = runtimes, .shared_global_lifecycle = false };
+            try runtimes[0].startWithLifecycle(io, gpa, max_output, worker, queue, null, .standalone);
+            return .{ .gpa = gpa, .io = io, .queue = queue, .runtimes = runtimes, .shared_global_lifecycle = false };
         }
 
         if (frankenphp_zig_php_is_zts() == 0) return error.ZtsRequired;
@@ -293,87 +366,85 @@ pub const Pool = struct {
 
         var started: usize = 0;
         errdefer {
-            for (runtimes[0..started]) |*runtime| runtime.stop();
+            queue.stop(io);
+            for (runtimes[0..started]) |*runtime| runtime.awaitStopped();
         }
         for (runtimes) |*runtime| {
-            try runtime.startPooled(io, gpa, max_output, worker);
+            try runtime.startPooled(io, gpa, max_output, worker, queue);
             started += 1;
         }
-        return .{ .gpa = gpa, .runtimes = runtimes, .shared_global_lifecycle = true };
+        return .{ .gpa = gpa, .io = io, .queue = queue, .runtimes = runtimes, .shared_global_lifecycle = true };
     }
 
     pub fn stop(pool: *Pool) void {
-        for (pool.runtimes) |*runtime| runtime.stop();
+        failQueuedJobs(&pool.runtimes[0], false);
+        for (pool.runtimes) |*runtime| runtime.awaitStopped();
+        pool.queue.waitUntilIdle(pool.io);
         pool.gpa.free(pool.runtimes);
+        pool.gpa.destroy(pool.queue);
         if (pool.shared_global_lifecycle) frankenphp_zig_php_shutdown();
         pool.* = undefined;
     }
 
     pub fn execute(pool: *Pool, allocator: Allocator, request: Request) !Response {
-        const index = pool.next.fetchAdd(1, .monotonic) % pool.runtimes.len;
-        return pool.runtimes[index].execute(allocator, request);
+        return pool.runtimes[0].execute(allocator, request);
     }
 
-    pub fn startStream(pool: *Pool, request: Request, queue_buffer: []u8) !Stream {
-        const index = pool.next.fetchAdd(1, .monotonic) % pool.runtimes.len;
-        return pool.runtimes[index].startStream(request, queue_buffer);
+    pub fn startDirectResponse(
+        pool: *Pool,
+        request: Request,
+        server_request: *std.http.Server.Request,
+        response_buffer: []u8,
+    ) !DirectResponse {
+        return pool.runtimes[0].startDirectResponse(request, server_request, response_buffer);
     }
 };
 
 pub fn stop(runtime: *PhpRuntime) void {
     if (!runtime.started) return;
     failQueuedJobs(runtime, false);
+    runtime.awaitStopped();
+    runtime.queue.waitUntilIdle(runtime.io);
+    if (runtime.owned_queue) |queue| runtime.gpa.destroy(queue);
+    runtime.owned_queue = null;
+}
+
+fn awaitStopped(runtime: *PhpRuntime) void {
+    if (!runtime.started) return;
     runtime.worker_group.await(runtime.io) catch |err| switch (err) {
         error.Canceled => {},
     };
     runtime.started = false;
 }
 
-pub fn startStream(runtime: *PhpRuntime, request: Request, queue_buffer: []u8) !Stream {
-    if (queue_buffer.len == 0) return error.InvalidStreamQueueCapacity;
+pub fn startDirectResponse(
+    runtime: *PhpRuntime,
+    request: Request,
+    server_request: *std.http.Server.Request,
+    response_buffer: []u8,
+) !DirectResponse {
+    if (response_buffer.len == 0) return error.InvalidResponseBuffer;
     const job = try Job.create(runtime, request);
     errdefer job.destroy();
-    job.streaming = true;
-    job.stream_queue = .init(queue_buffer);
-    try enqueue(runtime, job);
+    job.direct_transport = .{
+        .request = server_request,
+        .buffer = response_buffer,
+    };
+    try runtime.queue.enqueue(runtime.io, job);
     return .{ .job = job };
-}
-
-fn enqueue(runtime: *PhpRuntime, job: *Job) !void {
-    try runtime.mutex.lock(runtime.io);
-    errdefer runtime.mutex.unlock(runtime.io);
-    if (runtime.stopping) return error.RuntimeStopped;
-    if (runtime.queue_tail) |tail| tail.next = job else runtime.queue_head = job;
-    runtime.queue_tail = job;
-    runtime.queue_condition.signal(runtime.io);
-    runtime.mutex.unlock(runtime.io);
 }
 
 pub fn execute(runtime: *PhpRuntime, allocator: Allocator, request: Request) !Response {
     const job = try Job.create(runtime, request);
     var enqueued = false;
     errdefer if (!enqueued) job.destroy();
-
-    try runtime.mutex.lock(runtime.io);
-    if (runtime.stopping) {
-        runtime.mutex.unlock(runtime.io);
-        return error.RuntimeStopped;
-    }
-    if (runtime.queue_tail) |tail| tail.next = job else runtime.queue_head = job;
-    runtime.queue_tail = job;
+    try runtime.queue.enqueue(runtime.io, job);
     enqueued = true;
-    runtime.queue_condition.signal(runtime.io);
 
-    while (job.state != .completed) {
-        runtime.state_condition.wait(runtime.io, &runtime.mutex) catch |err| {
-            if (job.state != .completed) {
-                job.abandoned = true;
-                runtime.mutex.unlock(runtime.io);
-                return err;
-            }
-        };
-    }
-    runtime.mutex.unlock(runtime.io);
+    job.complete.wait(runtime.io) catch |err| {
+        if (cancelJob(job, true)) job.destroy();
+        return err;
+    };
 
     defer job.destroy();
     return job.response(allocator);
@@ -399,6 +470,7 @@ fn workerMain(runtime: *PhpRuntime) void {
     }
     runtime.mutex.unlock(runtime.io);
     if (!initialized) return;
+    runtime.interrupt_handle = frankenphp_zig_php_capture_interrupt_handle();
 
     defer switch (runtime.lifecycle) {
         .standalone => frankenphp_zig_php_shutdown(),
@@ -410,45 +482,9 @@ fn workerMain(runtime: *PhpRuntime) void {
 }
 
 fn runClassic(runtime: *PhpRuntime) void {
-    while (true) {
-        runtime.mutex.lockUncancelable(runtime.io);
-        while (runtime.queue_head == null and !runtime.stopping) {
-            runtime.queue_condition.waitUncancelable(runtime.io, &runtime.mutex);
-        }
-        if (runtime.queue_head == null and runtime.stopping) {
-            runtime.mutex.unlock(runtime.io);
-            return;
-        }
-
-        const job = runtime.queue_head.?;
-        runtime.queue_head = job.next;
-        if (runtime.queue_head == null) runtime.queue_tail = null;
-        job.next = null;
-        if (job.abandoned) {
-            job.state = .completed;
-            runtime.mutex.unlock(runtime.io);
-            job.destroy();
-            continue;
-        }
-        job.state = .running;
-        runtime.mutex.unlock(runtime.io);
-
+    while (acquireJob(runtime)) |job| {
         job.run();
-
-        if (job.streaming) {
-            job.response_ready.set(runtime.io);
-            if (job.has_flushed) {
-                publishPendingOutput(job);
-                job.stream_queue.close(runtime.io);
-            }
-        }
-        runtime.mutex.lockUncancelable(runtime.io);
-        const abandoned = job.abandoned;
-        job.state = .completed;
-        runtime.state_condition.broadcast(runtime.io);
-        runtime.mutex.unlock(runtime.io);
-
-        if (abandoned) job.destroy();
+        completeJob(job);
     }
 }
 
@@ -484,9 +520,9 @@ fn runWorker(runtime: *PhpRuntime, worker: Worker) void {
         active_job = null;
 
         runtime.mutex.lockUncancelable(runtime.io);
-        const stopping = runtime.stopping;
         const reached_acquire = runtime.worker_reached_acquire;
         runtime.mutex.unlock(runtime.io);
+        const stopping = isStopping(runtime);
         if (bootstrap.output.items.len != 0 and (result != 0 or !reached_acquire)) {
             std.log.err("PHP worker bootstrap: {s}", .{bootstrap.output.items});
         }
@@ -511,28 +547,36 @@ fn markWorkerFailed(runtime: *PhpRuntime) void {
 }
 
 fn failQueuedJobs(runtime: *PhpRuntime, initialization_failed: bool) void {
-    runtime.mutex.lockUncancelable(runtime.io);
-    runtime.stopping = true;
     if (initialization_failed) {
+        runtime.mutex.lockUncancelable(runtime.io);
         runtime.initialized = false;
         runtime.ready = true;
+        runtime.state_condition.broadcast(runtime.io);
+        runtime.mutex.unlock(runtime.io);
     }
 
+    const queue = runtime.queue;
+    queue.mutex.lockUncancelable(runtime.io);
+    queue.stopping = true;
     var abandoned: ?*Job = null;
-    while (runtime.queue_head) |job| {
-        runtime.queue_head = job.next;
+    while (queue.head) |job| {
+        queue.head = job.next;
         job.next = null;
         job.failure = error.RuntimeStopped;
-        job.state = .completed;
+        job.complete.set(runtime.io);
         if (job.abandoned) {
             job.next = abandoned;
             abandoned = job;
         }
     }
-    runtime.queue_tail = null;
-    runtime.state_condition.broadcast(runtime.io);
-    runtime.queue_condition.broadcast(runtime.io);
-    runtime.mutex.unlock(runtime.io);
+    queue.tail = null;
+    var running = queue.running_head;
+    while (running) |job| : (running = job.running_next) {
+        job.canceled.store(true, .release);
+        runtime.interrupt_fn(job.interrupt_handle);
+    }
+    queue.condition.broadcast(runtime.io);
+    queue.mutex.unlock(runtime.io);
 
     while (abandoned) |job| {
         abandoned = job.next;
@@ -541,9 +585,108 @@ fn failQueuedJobs(runtime: *PhpRuntime, initialization_failed: bool) void {
 }
 
 fn isStopping(runtime: *PhpRuntime) bool {
-    runtime.mutex.lockUncancelable(runtime.io);
-    defer runtime.mutex.unlock(runtime.io);
-    return runtime.stopping;
+    runtime.queue.mutex.lockUncancelable(runtime.io);
+    defer runtime.queue.mutex.unlock(runtime.io);
+    return runtime.queue.stopping;
+}
+
+fn acquireJob(runtime: *PhpRuntime) ?*Job {
+    const queue = runtime.queue;
+    queue.mutex.lockUncancelable(runtime.io);
+    while (true) {
+        while (queue.head == null and !queue.stopping) {
+            queue.condition.waitUncancelable(runtime.io, &queue.mutex);
+        }
+        if (queue.stopping) {
+            queue.mutex.unlock(runtime.io);
+            return null;
+        }
+
+        const job = queue.head.?;
+        queue.head = job.next;
+        if (queue.head == null) queue.tail = null;
+        job.next = null;
+        if (job.abandoned) {
+            queue.mutex.unlock(runtime.io);
+            job.complete.set(runtime.io);
+            job.destroy();
+            queue.mutex.lockUncancelable(runtime.io);
+            continue;
+        }
+
+        job.state = .running;
+        job.interrupt_handle = runtime.interrupt_handle;
+        job.running_next = queue.running_head;
+        queue.running_head = job;
+        queue.mutex.unlock(runtime.io);
+        return job;
+    }
+}
+
+fn completeJob(job: *Job) void {
+    const runtime = job.runtime;
+    if (job.canceled.load(.acquire)) job.failure = error.Canceled;
+    if (job.direct_transport) |*direct| finishDirectResponse(job, direct);
+
+    const queue = runtime.queue;
+    queue.mutex.lockUncancelable(runtime.io);
+    var running = &queue.running_head;
+    while (running.*) |current| {
+        if (current == job) {
+            running.* = current.running_next;
+            break;
+        }
+        running = &current.running_next;
+    }
+    job.running_next = null;
+    const abandoned = job.abandoned;
+    job.complete.set(runtime.io);
+    queue.mutex.unlock(runtime.io);
+
+    if (abandoned) job.destroy();
+}
+
+/// Cancels a job and returns whether its caller still owns its allocation.
+fn cancelJob(job: *Job, abandon: bool) bool {
+    const runtime = job.runtime;
+    const queue = runtime.queue;
+    queue.mutex.lockUncancelable(runtime.io);
+    if (job.complete.isSet()) {
+        queue.mutex.unlock(runtime.io);
+        return true;
+    }
+
+    job.canceled.store(true, .release);
+    job.abandoned = abandon;
+    if (job.state == .queued) {
+        var current = queue.head;
+        var previous: ?*Job = null;
+        while (current) |candidate| {
+            if (candidate == job) {
+                if (previous) |before| before.next = candidate.next else queue.head = candidate.next;
+                if (queue.tail == candidate) queue.tail = previous;
+                candidate.next = null;
+                candidate.failure = error.Canceled;
+                candidate.complete.set(runtime.io);
+                queue.mutex.unlock(runtime.io);
+                if (abandon) candidate.destroy();
+                return !abandon;
+            }
+            previous = candidate;
+            current = candidate.next;
+        }
+    }
+
+    const interrupt_handle = job.interrupt_handle;
+    queue.mutex.unlock(runtime.io);
+    runtime.interrupt_fn(interrupt_handle);
+    return !abandon;
+}
+
+fn ignoreInterrupt(_: CInterruptHandle) void {}
+
+fn phpInterrupt(handle: CInterruptHandle) void {
+    frankenphp_zig_php_interrupt(handle);
 }
 
 fn cRequest(request: *const OwnedRequest) CRequest {
@@ -569,53 +712,19 @@ export fn frankenphp_zig_worker_acquire() callconv(.c) ?*const CRequest {
         runtime.state_condition.broadcast(runtime.io);
     }
     runtime.worker_reached_acquire = true;
+    runtime.mutex.unlock(runtime.io);
 
-    while (true) {
-        while (runtime.queue_head == null and !runtime.stopping) {
-            runtime.queue_condition.waitUncancelable(runtime.io, &runtime.mutex);
-        }
-        if (runtime.stopping) {
-            runtime.mutex.unlock(runtime.io);
-            return null;
-        }
-
-        const job = runtime.queue_head.?;
-        runtime.queue_head = job.next;
-        if (runtime.queue_head == null) runtime.queue_tail = null;
-        job.next = null;
-        if (job.abandoned) {
-            job.state = .completed;
-            job.destroy();
-            continue;
-        }
-
-        job.state = .running;
-        active_job = job;
-        runtime.mutex.unlock(runtime.io);
-        return &job.c_request;
-    }
+    const job = acquireJob(runtime) orelse return null;
+    active_job = job;
+    return &job.c_request;
 }
 
 export fn frankenphp_zig_worker_complete(success: c_int) callconv(.c) void {
     const job = active_job orelse return;
-    const runtime = job.runtime;
     if (success == 0 and job.failure == null) job.failure = error.ExecutionFailed;
     active_job = null;
 
-    if (job.streaming) {
-        job.response_ready.set(runtime.io);
-        if (job.has_flushed) {
-            publishPendingOutput(job);
-            job.stream_queue.close(runtime.io);
-        }
-    }
-    runtime.mutex.lockUncancelable(runtime.io);
-    const abandoned = job.abandoned;
-    job.state = .completed;
-    runtime.state_condition.broadcast(runtime.io);
-    runtime.mutex.unlock(runtime.io);
-
-    if (abandoned) job.destroy();
+    completeJob(job);
 }
 
 fn cloneRequest(allocator: Allocator, request: Request) !OwnedRequest {
@@ -644,26 +753,64 @@ fn currentJob() ?*Job {
     return active_job;
 }
 
-fn publishPendingOutput(job: *Job) void {
-    if (job.output.items.len == 0) return;
-    job.stream_queue.putAll(job.runtime.io, job.output.items) catch {
-        job.failure = error.RuntimeStopped;
-        return;
+fn statusAllowsBody(status: u16) bool {
+    return !((status >= 100 and status < 200) or status == 204 or status == 304);
+}
+
+fn beginDirectResponse(job: *Job, direct: *DirectTransport) bool {
+    if (job.canceled.load(.acquire)) return false;
+    if (direct.writer != null) return true;
+    direct.writer = direct.request.respondStreaming(direct.buffer, .{
+        .respond_options = .{
+            .status = @enumFromInt(job.status),
+            .extra_headers = job.headers.items,
+        },
+    }) catch {
+        job.failure = error.WriteFailed;
+        return false;
     };
-    job.output.clearRetainingCapacity();
+    return true;
+}
+
+fn finishDirectResponse(job: *Job, direct: *DirectTransport) void {
+    if (job.failure == null and !beginDirectResponse(job, direct)) return;
+    if (direct.writer) |*writer| writer.end() catch {
+        job.failure = error.WriteFailed;
+    };
+}
+
+export fn frankenphp_zig_headers_complete() callconv(.c) c_int {
+    const job = currentJob() orelse return 0;
+    if (job.direct_transport) |*direct| return @intFromBool(beginDirectResponse(job, direct));
+    return 1;
 }
 
 export fn frankenphp_zig_flush() callconv(.c) void {
     const job = currentJob() orelse return;
-    if (!job.streaming) return;
-    job.has_flushed = true;
-    job.response_ready.set(job.runtime.io);
-    publishPendingOutput(job);
+    const direct = if (job.direct_transport) |*direct| direct else return;
+    if (job.canceled.load(.acquire) or job.failure != null or !statusAllowsBody(job.status)) return;
+    const writer = if (direct.writer) |*writer| writer else return;
+    writer.writer.flush() catch {
+        job.failure = error.WriteFailed;
+        return;
+    };
+    writer.flush() catch {
+        job.failure = error.WriteFailed;
+    };
 }
 
 export fn frankenphp_zig_write(bytes: [*]const u8, length: usize) callconv(.c) usize {
     const job = currentJob() orelse return 0;
-    if (job.failure != null) return 0;
+    if (job.canceled.load(.acquire) or job.failure != null) return 0;
+    if (job.direct_transport) |*direct| {
+        if (!statusAllowsBody(job.status)) return length;
+        const writer = if (direct.writer) |*writer| writer else return 0;
+        writer.writer.writeAll(bytes[0..length]) catch {
+            job.failure = error.WriteFailed;
+            return 0;
+        };
+        return length;
+    }
     if (length > job.runtime.max_output -| job.output.items.len) {
         job.failure = error.OutputTooLarge;
         return 0;
@@ -802,9 +949,11 @@ test "embedded response headers reject invalid data and framing headers" {
 }
 
 test "worker failure completes every queued job" {
+    var queue: JobQueue = .{};
     var runtime: PhpRuntime = .{
         .io = std.testing.io,
         .gpa = std.testing.allocator,
+        .queue = &queue,
     };
     const request: Request = .{
         .script_filename = "/worker.php",
@@ -822,15 +971,15 @@ test "worker failure completes every queued job" {
     const second = try Job.create(&runtime, request);
     defer second.destroy();
     first.next = second;
-    runtime.queue_head = first;
-    runtime.queue_tail = second;
+    queue.head = first;
+    queue.tail = second;
 
     markWorkerFailed(&runtime);
 
-    try std.testing.expectEqual(JobState.completed, first.state);
-    try std.testing.expectEqual(JobState.completed, second.state);
+    try std.testing.expect(first.complete.isSet());
+    try std.testing.expect(second.complete.isSet());
     try std.testing.expect(first.failure.? == error.RuntimeStopped);
     try std.testing.expect(second.failure.? == error.RuntimeStopped);
-    try std.testing.expect(runtime.queue_head == null);
-    try std.testing.expect(runtime.queue_tail == null);
+    try std.testing.expect(queue.head == null);
+    try std.testing.expect(queue.tail == null);
 }

@@ -404,39 +404,19 @@ fn servePhp(
         .variables = variables,
         .headers_only = headers_only,
     };
-    var stream_queue_buffer: [64 * 1024]u8 = undefined;
-    var stream = server.php_runtimes.startStream(php_request, &stream_queue_buffer) catch |err| switch (err) {
+    var output_buffer: [16 * 1024]u8 = undefined;
+    var response = server.php_runtimes.startDirectResponse(php_request, request, &output_buffer) catch |err| switch (err) {
         error.RuntimeStopped => return respondText(request, .service_unavailable, "PHP runtime unavailable\n"),
         else => return err,
     };
-    defer stream.deinit();
-    stream.waitForHeaders() catch |err| switch (err) {
-        error.OutputTooLarge => return respondText(request, .bad_gateway, "PHP output too large\n"),
-        error.InvalidResponse, error.ExecutionFailed => return respondText(request, .bad_gateway, "PHP execution failed\n"),
-        else => return err,
+    defer response.deinit();
+    response.waitForCompletion() catch |err| {
+        if (response.started()) return err;
+        return switch (err) {
+            error.InvalidResponse, error.ExecutionFailed => respondText(request, .bad_gateway, "PHP execution failed\n"),
+            else => err,
+        };
     };
-
-    if (stream.bufferedBody()) |response_body| {
-        return request.respond(response_body, .{
-            .status = stream.status(),
-            .extra_headers = stream.headers(),
-        });
-    }
-
-    var output_buffer: [16 * 1024]u8 = undefined;
-    var writer = try request.respondStreaming(&output_buffer, .{ .respond_options = .{
-        .status = stream.status(),
-        .extra_headers = stream.headers(),
-    } });
-    var chunk_buffer: [16 * 1024]u8 = undefined;
-    while (true) {
-        const length = try stream.read(&chunk_buffer);
-        if (length == 0) break;
-        try writer.writer.writeAll(chunk_buffer[0..length]);
-        try writer.writer.flush();
-        try writer.flush();
-    }
-    try writer.end();
 }
 
 fn respondText(request: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {

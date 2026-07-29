@@ -3,6 +3,10 @@
 if ($_SERVER['PATH_INFO'] === '/slow') {
     sleep(10);
 }
+if ($_SERVER['PATH_INFO'] === '/loop') {
+    while (true) {
+    }
+}
 if ($_SERVER['PATH_INFO'] === '/not-found') {
     http_response_code(404);
 }

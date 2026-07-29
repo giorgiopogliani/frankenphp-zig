@@ -14,6 +14,22 @@ while ($requestCount < $maxRequests && frankenphp_handle_request(static function
         exit(1);
     }
     $requestCount++;
+    if ($_SERVER['REQUEST_URI'] === '/loop') {
+        while (true) {
+        }
+    }
+    if ($_SERVER['REQUEST_URI'] === '/slow') {
+        usleep(1000000);
+    }
+    if ($_SERVER['REQUEST_URI'] === '/sse') {
+        header('Content-Type: text/event-stream');
+        echo "data: first\n\n";
+        flush();
+        usleep(2000000);
+        echo "data: second\n\n";
+        flush();
+        return;
+    }
     if ($_SERVER['REQUEST_URI'] === '/buffer') {
         ob_start();
         echo 'buffered:';

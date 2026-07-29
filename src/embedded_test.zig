@@ -23,6 +23,62 @@ test "ZTS PHP runtime pool executes requests" {
     try std.testing.expectEqual(std.http.Status.ok, response.status);
 }
 
+test "shared pool queue dispatches around a busy PHP worker" {
+    const bootstrap_variables = [_]PhpRuntime.Variable{
+        .{ .name = "FRANKENPHP_WORKER", .value = "1" },
+        .{ .name = "MAX_REQUESTS", .value = "100" },
+    };
+    var pool = try PhpRuntime.Pool.start(std.testing.io, std.testing.allocator, 1024 * 1024, .{
+        .script_filename = build_options.worker_fixture_path,
+        .variables = &bootstrap_variables,
+    }, 2);
+    defer pool.stop();
+
+    var slow_done: std.atomic.Value(bool) = .init(false);
+    var requests: std.Io.Group = .init;
+    requests.concurrent(std.testing.io, executeSlowWorkerRequest, .{ &pool, &slow_done }) catch unreachable;
+    try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(100) }, std.testing.io);
+
+    var first = try executePoolWorkerRequest(&pool, "/fast-one");
+    defer first.deinit();
+    var second = try executePoolWorkerRequest(&pool, "/fast-two");
+    defer second.deinit();
+    try std.testing.expect(!slow_done.load(.acquire));
+
+    try requests.await(std.testing.io);
+}
+
+test "pool shutdown interrupts a running PHP request" {
+    var pool = try PhpRuntime.Pool.start(std.testing.io, std.testing.allocator, 1024 * 1024, null, 1);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var requests: std.Io.Group = .init;
+    requests.concurrent(std.testing.io, executeInfiniteRequest, .{ &pool, &canceled }) catch unreachable;
+
+    try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(100) }, std.testing.io);
+    pool.stop();
+    try requests.await(std.testing.io);
+    try std.testing.expect(canceled.load(.acquire));
+}
+
+test "pool shutdown interrupts a running persistent worker request" {
+    const bootstrap_variables = [_]PhpRuntime.Variable{
+        .{ .name = "FRANKENPHP_WORKER", .value = "1" },
+        .{ .name = "MAX_REQUESTS", .value = "100" },
+    };
+    var pool = try PhpRuntime.Pool.start(std.testing.io, std.testing.allocator, 1024 * 1024, .{
+        .script_filename = build_options.worker_fixture_path,
+        .variables = &bootstrap_variables,
+    }, 1);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var requests: std.Io.Group = .init;
+    requests.concurrent(std.testing.io, executeInfiniteWorkerRequest, .{ &pool, &canceled }) catch unreachable;
+
+    try std.Io.Clock.Duration.sleep(.{ .clock = .awake, .raw = .fromMilliseconds(500) }, std.testing.io);
+    pool.stop();
+    try requests.await(std.testing.io);
+    try std.testing.expect(canceled.load(.acquire));
+}
+
 test "PHP stays embedded and resets request state" {
     var runtime: PhpRuntime = .{};
     try runtime.start(std.testing.io, std.testing.allocator, 1024 * 1024, null);
@@ -288,6 +344,83 @@ test "worker bootstrap must reach request loop" {
         1024 * 1024,
         .{ .script_filename = build_options.worker_exit_fixture_path, .variables = &.{} },
     ));
+}
+
+fn executeSlowWorkerRequest(pool: *PhpRuntime.Pool, done: *std.atomic.Value(bool)) void {
+    var response = executePoolWorkerRequest(pool, "/slow") catch return;
+    response.deinit();
+    done.store(true, .release);
+}
+
+fn executePoolWorkerRequest(pool: *PhpRuntime.Pool, uri: []const u8) !PhpRuntime.Response {
+    const variables = [_]PhpRuntime.Variable{
+        .{ .name = "REQUEST_METHOD", .value = "GET" },
+        .{ .name = "REQUEST_URI", .value = uri },
+        .{ .name = "QUERY_STRING", .value = "" },
+        .{ .name = "SERVER_NAME", .value = "localhost" },
+        .{ .name = "SERVER_PORT", .value = "8080" },
+        .{ .name = "CONTENT_TYPE", .value = "" },
+        .{ .name = "CONTENT_LENGTH", .value = "0" },
+    };
+    return pool.execute(std.testing.allocator, .{
+        .script_filename = build_options.worker_fixture_path,
+        .method = "GET",
+        .uri = uri,
+        .query = "",
+        .content_type = null,
+        .cookies = null,
+        .body = "",
+        .variables = &variables,
+        .headers_only = false,
+    });
+}
+
+fn executeInfiniteRequest(pool: *PhpRuntime.Pool, canceled: *std.atomic.Value(bool)) void {
+    const variables = [_]PhpRuntime.Variable{
+        .{ .name = "PATH_INFO", .value = "/loop" },
+    };
+    var response = pool.execute(std.testing.allocator, .{
+        .script_filename = build_options.fixture_path,
+        .method = "GET",
+        .uri = "/loop",
+        .query = "",
+        .content_type = null,
+        .cookies = null,
+        .body = "",
+        .variables = &variables,
+        .headers_only = false,
+    }) catch |err| {
+        canceled.store(err == error.Canceled, .release);
+        return;
+    };
+    response.deinit();
+}
+
+fn executeInfiniteWorkerRequest(pool: *PhpRuntime.Pool, canceled: *std.atomic.Value(bool)) void {
+    const variables = [_]PhpRuntime.Variable{
+        .{ .name = "REQUEST_METHOD", .value = "GET" },
+        .{ .name = "REQUEST_URI", .value = "/loop" },
+        .{ .name = "QUERY_STRING", .value = "" },
+        .{ .name = "SERVER_NAME", .value = "localhost" },
+        .{ .name = "SERVER_PORT", .value = "8080" },
+        .{ .name = "CONTENT_TYPE", .value = "" },
+        .{ .name = "CONTENT_LENGTH", .value = "0" },
+    };
+    var response = pool.execute(std.testing.allocator, .{
+        .script_filename = build_options.worker_fixture_path,
+        .method = "GET",
+        .uri = "/loop",
+        .query = "",
+        .content_type = null,
+        .cookies = null,
+        .body = "",
+        .variables = &variables,
+        .headers_only = false,
+    }) catch |err| {
+        canceled.store(err == error.Canceled, .release);
+        return;
+    };
+    response.deinit();
 }
 
 const WorkerRequestOptions = struct {

@@ -2,6 +2,9 @@
 
 #include <signal.h>
 #include <string.h>
+#ifndef PHP_WIN32
+#include <pthread.h>
+#endif
 
 #include "php.h"
 #include "php_main.h"
@@ -28,6 +31,28 @@ static const char FRANKENPHP_INI[] =
 static const char *WORKER_MODULES_TO_RELOAD[] = {"filter", NULL};
 ZEND_TLS int frankenphp_worker_mode = 0;
 ZEND_TLS int frankenphp_worker_booting = 0;
+
+#if defined(__linux__) || defined(__FreeBSD__)
+#define FRANKENPHP_ZIG_INTERRUPT_SIGNAL (SIGRTMIN + 3)
+static pthread_once_t frankenphp_interrupt_once = PTHREAD_ONCE_INIT;
+static zend_atomic_bool frankenphp_interrupt_signal_ready;
+
+static void frankenphp_interrupt_signal_handler(int signal_number)
+{
+    (void) signal_number;
+}
+
+static void frankenphp_install_interrupt_signal(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = frankenphp_interrupt_signal_handler;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(FRANKENPHP_ZIG_INTERRUPT_SIGNAL, &action, NULL) == 0) {
+        zend_atomic_bool_store(&frankenphp_interrupt_signal_ready, true);
+    }
+}
+#endif
 
 PHP_FUNCTION(frankenphp_handle_request);
 
@@ -107,6 +132,9 @@ static int frankenphp_send_headers(sapi_headers_struct *headers)
         header = zend_llist_get_next_ex(&headers->headers, &position);
     }
 
+    if (!frankenphp_zig_headers_complete()) {
+        return SAPI_HEADER_SEND_FAILED;
+    }
     return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
 
@@ -287,7 +315,11 @@ static int frankenphp_worker_request_startup(const frankenphp_zig_request *reque
 
         /* php_request_startup() normally creates this timer. Worker mode
          * preserves the process, so reset it for every handled request. */
-        zend_set_timeout(EG(timeout_seconds), 1);
+        if (EG(timeout_seconds) > 0) {
+            zend_set_timeout(EG(timeout_seconds), 1);
+        } else {
+            zend_unset_timeout();
+        }
 
         if (PG(output_handler) && PG(output_handler)[0]) {
             zval output_handler;
@@ -509,6 +541,34 @@ void frankenphp_zig_php_thread_shutdown(void)
 {
 #ifdef ZTS
     ts_free_thread();
+#endif
+}
+
+frankenphp_zig_interrupt_handle frankenphp_zig_php_capture_interrupt_handle(void)
+{
+    frankenphp_zig_interrupt_handle handle = {
+        .vm_interrupt = &EG(vm_interrupt),
+        .timed_out = &EG(timed_out),
+        .thread = 0,
+    };
+#if defined(__linux__) || defined(__FreeBSD__)
+    handle.thread = (uintptr_t) pthread_self();
+    pthread_once(&frankenphp_interrupt_once, frankenphp_install_interrupt_signal);
+#endif
+    return handle;
+}
+
+void frankenphp_zig_php_interrupt(frankenphp_zig_interrupt_handle handle)
+{
+    if (handle.vm_interrupt == NULL || handle.timed_out == NULL) {
+        return;
+    }
+    zend_atomic_bool_store((zend_atomic_bool *) handle.timed_out, true);
+    zend_atomic_bool_store((zend_atomic_bool *) handle.vm_interrupt, true);
+#if defined(__linux__) || defined(__FreeBSD__)
+    if (handle.thread != 0 && zend_atomic_bool_load(&frankenphp_interrupt_signal_ready)) {
+        (void) pthread_kill((pthread_t) handle.thread, FRANKENPHP_ZIG_INTERRUPT_SIGNAL);
+    }
 #endif
 }
 
